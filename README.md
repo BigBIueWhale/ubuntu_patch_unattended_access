@@ -1,5 +1,9 @@
 # Unattended Remote Desktop on Ubuntu 24.04 (Wayland, GNOME) — Portal Auto-Approve Patch
 
+How to get rid of this brain-dead prompt that keeps appearing on Wayland when trying to use TeamViewer and/or RustDesk?
+
+<img src="doc/remote_desktop_pop_up.png" style="max-width: 420px; width: 100%;" alt="Screenshot" />
+
 This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.04 LTS (Noble)** with **GNOME on Wayland** and the **GNOME xdg-desktop-portal backend**.
 
 > **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` so that:
@@ -341,20 +345,22 @@ journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-page
 
 * **`src/remotedesktopdialog.c`**
 
-  * Inside `remote_desktop_dialog_new(...)`:
+  * Adds a small helper `auto_approve_remote_desktop_idle(...)` that:
 
-    * Forces **“Allow Remote Interaction”** ON,
-    * Marks a source as “selected” so **Share** is permitted,
-    * Immediately calls the dialog’s accept handler (**acts like Share was clicked**).
+    * Turns **“Allow Remote Interaction”** ON.
+    * Marks a source as “selected” so **Share** is permitted.
+    * Invokes the dialog’s accept handler (**as if Share was clicked**).
+  * Inside `remote_desktop_dialog_new(...)`, schedules that helper with `g_idle_add(...)` instead of clicking immediately. This defers the accept until the dialog is realized and the caller has connected to the `"done"` signal, so the emission is received.
+  * Removes the old “immediate click” injection if it exists (to avoid firing too early).
 
-  **Result:** No consent dialog for Remote-Desktop; unattended approval.
+  **Result:** The consent dialog no longer blocks. It may flash briefly, then auto-dismisses as **Share** is programmatically pressed after realization—yielding reliable unattended approval.
 
 * **`src/screencast.c`**
 
   * Adds `start_first_monitor(ScreenCastSession*)` to select the **first logical monitor** and call `start_session(...)`.
   * In `handle_start(...)`: if `restore_stream_from_data(...)` fails, attempts unattended **first-monitor** start before falling back to the chooser.
 
-  **Result:** When there is no valid restore token, Screencast auto-shares the first monitor without prompting.
+  **Result:** When there is no valid restore token, Screencast auto-shares the first monitor without prompting; the monitor grid typically never appears.
 
 ---
 

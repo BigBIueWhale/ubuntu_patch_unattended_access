@@ -5,6 +5,9 @@ patch_portal_autoapprove.py
 Highly-opinionated, environment-distrusting patcher for GNOME's
 xdg-desktop-portal-gnome (tested on 46.2 and 49.0) to:
   1) Auto-approve Remote-Desktop dialog (enable "Allow Remote Interaction", press Share)
+     **but deferred**: we trigger Share on the GTK idle loop so the dialog
+     is realized and the caller is already connected to the "done" signal.
+     This fixes the "window still pops up with switch ON" symptom.
   2) Auto-select first output for Screencast when no restore data is available
 
 Targets (must match the known-good layout for your tag; tested on 46.2 and 49.0):
@@ -96,47 +99,118 @@ def detect_tag(root):
         pass
     return None
 
+# ------------------------------- REMOTEDESKTOP --------------------------------
+
+def _ensure_idle_helper_inserted(text):
+    """
+    Ensure our deferred auto-approve helper exists *above* remote_desktop_dialog_new(...).
+    We place it immediately before the function declaration for stability.
+    """
+    if "OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED" in text:
+        return text  # already present
+
+    # Find start of remote_desktop_dialog_new to insert helper right before it.
+    new_decl = re.search(r"\n(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{)", text)
+    if not new_decl:
+        die("Could not find remote_desktop_dialog_new() declaration to insert idle helper before it.")
+
+    helper = textwrap.dedent(r"""
+        /* === OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED ===
+         * We defer the "Share" click until the GTK idle loop so:
+         *  - The dialog is realized and the **orange Share button** exists.
+         *  - External code has already connected to the "done" signal.
+         *
+         * Visual effect on the dialog you described:
+         *  - The centered white dialog may flash momentarily (or not be noticeable).
+         *  - The **Allow Remote Interaction** toggle is ON.
+         *  - The dialog auto-confirms as if **Share** was pressed, so it disappears immediately,
+         *    skipping the screen/monitor grid selection UI you described ("LG 24\"" vs "Telecom 23\"").
+         */
+        static gboolean
+        auto_approve_remote_desktop_idle (gpointer user_data)
+        {
+          RemoteDesktopDialog *dialog = REMOTE_DESKTOP_DIALOG (user_data);
+
+          /* Turn ON the permission toggle you see in the first row (orange track + white knob). */
+          adw_switch_row_set_active (dialog->allow_remote_interaction_switch, TRUE);
+
+          /* Satisfy accept gating even if no screen cast selection has happened yet. */
+          dialog->is_screen_cast_sources_selected = TRUE;
+
+          /*
+           * Now we "press" the bright orange **Share** button.
+           * Because this happens on idle, the parent has already connected to "done",
+           * so the emission is received and the dialog closes instead of lingering.
+           */
+          button_clicked (GTK_WIDGET (dialog->accept_button), dialog);
+
+          return G_SOURCE_REMOVE; /* run once */
+        }
+        /* === /OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED === */
+    """).strip("\n") + "\n\n"
+
+    insert_at = new_decl.start(1)
+    return text[:insert_at] + helper + text[insert_at:]
+
+
+def _remove_old_immediate_block(body):
+    """
+    If a previous run injected the "immediate click" block (OPINIONATED_PATCH_AUTO_APPROVE),
+    remove it so we don't click too early (before signals/realize).
+    """
+    pattern = re.compile(
+        r"/\*\s*===\s*OPINIONATED_PATCH_AUTO_APPROVE\s*===.*?/\*\s*===\s*/OPINIONATED_PATCH_AUTO_APPROVE\s*===\s*\*/",
+        re.S
+    )
+    return re.sub(pattern, "", body)
+
+
 def patch_remotedesktopdialog_c(text):
     """
-    Strategy:
-      In remote_desktop_dialog_new(...):
-        - Ensure "Allow Remote Interaction" is ON
-        - Mark 'is_screen_cast_sources_selected' true (satisfies accept gating)
-        - Immediately call button_clicked(accept_button, dialog) to emit DONE/Share
-      This bypasses any UI and unconditionally approves interaction.
-
-      We inject right before the final 'return dialog;' in remote_desktop_dialog_new.
+    Strategy (deferred accept):
+      - Insert static gboolean auto_approve_remote_desktop_idle(...) helper.
+      - In remote_desktop_dialog_new(...), schedule it with g_idle_add(...)
+        right before 'return dialog;'.
+      - Remove any older "immediate click" injection to avoid early emission.
     """
+    # 1) Ensure the idle helper is present above the constructor
+    text = _ensure_idle_helper_inserted(text)
+
+    # 2) Locate constructor body
     func_re = r"(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{\s*)(.*?)(\n\s*return\s+dialog;\s*\})"
     m = re.search(func_re, text, flags=re.S)
     if not m:
         die("Could not locate remote_desktop_dialog_new body for patching.")
 
-    body = m.group(2)
-    # Avoid double-inject
-    if "OPINIONATED_PATCH_AUTO_APPROVE" in body:
-        return text  # already patched
+    prefix, body, suffix = m.group(1), m.group(2), m.group(3)
 
+    # 3) Remove any previous "immediate" block if present
+    body = _remove_old_immediate_block(body)
+
+    # 4) Avoid double scheduling
+    if "g_idle_add (auto_approve_remote_desktop_idle, dialog);" in body:
+        # already patched with deferred approach
+        return text
+
+    # 5) Inject the deferred schedule call just before return
     inject = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_AUTO_APPROVE ===
-         * Short-circuit Remote Desktop dialog:
-         *   - Force "Allow Remote Interaction" ON
-         *   - Pretend a screen-cast source is selected (so "Share" is allowed)
-         *   - Immediately trigger the accept handler (equivalent to pressing Share)
+        /* === OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE ===
+         * Schedule auto-approve on the GTK idle loop.
          *
-         * This intentionally bypasses consent UI; use only on machines you administer.
+         * Visual impact:
+         *  - If the dialog becomes visible at all, it will *immediately* dismiss itself.
+         *  - You will not have to click **Share** (orange button) nor choose monitors in the grid.
+         *  - The toggle **Allow Remote Interaction** is programmatically set to ON right before accept.
          */
-        adw_switch_row_set_active (dialog->allow_remote_interaction_switch, TRUE);
-        dialog->is_screen_cast_sources_selected = TRUE;
-
-        /* Immediately behave as if user clicked Share */
-        button_clicked (GTK_WIDGET (dialog->accept_button), dialog);
-        /* === /OPINIONATED_PATCH_AUTO_APPROVE === */
+        g_idle_add (auto_approve_remote_desktop_idle, dialog);
+        /* === /OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE === */
     """).strip("\n")
 
-    new_body = body + "\n\n  " + inject + "\n"
+    new_body = body.rstrip() + "\n\n  " + inject + "\n"
     patched = text[:m.start(2)] + new_body + text[m.end(2):]
     return patched
+
+# -------------------------------- SCREENCAST ----------------------------------
 
 def patch_screencast_c(text):
     """
@@ -159,6 +233,10 @@ def patch_screencast_c(text):
             /* === OPINIONATED_PATCH_START_FIRST_MONITOR ===
              * Try to auto-pick the first logical monitor as a Screencast source.
              * Returns TRUE if session successfully started.
+             *
+             * Visual effect on the dialog you described:
+             *   - When Screencast would normally show a monitor grid, we auto-select the first
+             *     tile (your “LG 24\"” in the example) and proceed, so the chooser usually won’t appear.
              */
             static gboolean
             start_first_monitor (ScreenCastSession *screen_cast_session)
@@ -216,10 +294,8 @@ def patch_screencast_c(text):
 
     body = hm.group(2)
 
-    # Robustly find the restore branch: match any argument list inside (...) with [^)]*
-    branch_re = (
-        r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[^)]*\)\s*\)\s*\{\s*(.*?)\s*\}"
-    )
+    # Robustly find the restore branch
+    branch_re = (r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[^)]*\)\s*\)\s*\{\s*(.*?)\s*\}")
     bm = re.search(branch_re, body, flags=re.S)
     if not bm:
         die("Could not find the '!restore_stream_from_data' branch in handle_start().")
@@ -232,6 +308,9 @@ def patch_screencast_c(text):
         /* === OPINIONATED_PATCH_TRY_FIRST_MONITOR ===
          * Try unattended path: start the first monitor immediately.
          * Only fall back to the chooser dialog if that fails.
+         *
+         * Visual impact:
+         *   - The monitor selection grid (two tiles) usually won’t be shown; we auto-pick the first tile.
          */
         if (start_first_monitor (screen_cast_session))
           return TRUE;
@@ -258,6 +337,8 @@ def patch_screencast_c(text):
     text = text[:hm.start(2)] + new_body + text[hm.end(2):]
     return text
 
+# ----------------------------------- MAIN ------------------------------------
+
 def main():
     if len(sys.argv) != 2:
         die("Provide the path to your local checkout of the chosen tag (e.g., 46.2/49.0):\n"
@@ -283,11 +364,11 @@ def main():
         assert_sentinels(p, s, SENTINELS[short])
         texts[short] = (p, s)
 
-    # Patch remotedesktopdialog.c
+    # Patch remotedesktopdialog.c (deferred auto-approve)
     rpath, rtext = texts["remotedesktopdialog.c"]
     rpatched = patch_remotedesktopdialog_c(rtext)
 
-    # Patch screencast.c
+    # Patch screencast.c (auto-pick first monitor)
     spath, stext = texts["screencast.c"]
     spatched = patch_screencast_c(stext)
 
@@ -305,7 +386,7 @@ def main():
         print(f"[SKIP] {spath} already patched; left as-is (backup untouched).")
 
     print("\nNext steps:\n"
-          "  1) Build + install (see README.md below)\n"
+          "  1) Build + install (see README.md)\n"
           "  2) Restart user portal services\n")
 
 if __name__ == "__main__":
