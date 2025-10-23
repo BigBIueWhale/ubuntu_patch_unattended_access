@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Unattended Remote Access on Ubuntu 24.04 Wayland: Why the “Portal” Prompt Appears, How GNOME & RustDesk Handle It, and Why It Sometimes “Breaks Overnight”</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height: 1.45; max-width: 1100px; margin: 2rem auto; padding: 0 1rem; }
+    code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+    pre { background: #f6f8fa; padding: 1rem; overflow-x: auto; border: 1px solid #e5e7eb; border-radius: 6px; }
+    h1, h2, h3 { margin-top: 1.6em; }
+    small { color: #666; }
+    a { text-decoration: none; color: #0059c1; }
+    a:hover { text-decoration: underline; }
+    .quote { border-left: 4px solid #ddd; padding-left: 1rem; color: #333; margin: 1rem 0; }
+  </style>
+</head>
+<body>
+
+<h1>Unattended Remote Access on Ubuntu 24.04 Wayland</h1>
+<h2>Why the “Portal” Prompt Appears, How GNOME & RustDesk Handle It, and Why It Sometimes “Breaks Overnight”</h2>
+
+<p><strong>Audience:</strong> Readers with no prior context about Wayland, XDG Portals, GNOME, or RustDesk specifics.</p>
+
+<hr />
+
+<h2>0) Your Goal & Observed Symptoms (as established from your setup)</h2>
+
+<ul>
+  <li><strong>Goal:</strong> Headless/unattended, reliable remote control of an Ubuntu 24.04 LTS machine running Wayland (GNOME), using tools like RustDesk/TeamViewer — <em>without</em> a local user having to approve a dialog pop-up each time.</li>
+  <li><strong>Your environment:</strong> Ubuntu 24.04 GNOME Wayland; Intel iGPU driving a port; you use an EDID/HDMI/DP “display stub” so the compositor believes a monitor is present; you prefer Wayland because GNOME/Mutter keeps VRAM usage low vs Xorg.</li>
+  <li><strong>The prompt:</strong> When a Wayland “remote desktop” session is requested, a “<em>Portal — Remote Desktop</em>” dialog appears with a toggle <em>Allow Remote Interaction</em>, and “Cancel/Share” buttons. With multiple monitors, you must choose one. Unattended, this blocks you.</li>
+  <li><strong>What starts working (temporarily):</strong> After you manually approve once, subsequent connections often succeed silently (no prompt) — until the <em>display topology changes</em> (different EDID, added/removed displays) <strong>or</strong> the persisted authorization chain breaks. You observed a case where it “just stopped overnight.”</li>
+</ul>
+
+<p><strong>Executive summary of the root causes:</strong></p>
+<ol>
+  <li>On GNOME Wayland, <strong>user consent is enforced</strong> via the XDG Desktop Portal. The GNOME backend presents that dialog by design.</li>
+  <li>The portal offers persistence using a <strong>single-use <code>restore_token</code></strong>. After each successful start, a new token must be stored for the next unattended session. If the application <em>misses writing back</em> the new token once, the chain is broken and unattended access fails until someone clicks “Share” again.</li>
+  <li>Changing monitors / EDIDs can invalidate the stored session entirely, forcing a new approval even if tokens were rotated correctly.</li>
+</ol>
+
+<hr />
+
+<h2>1) Where the Prompt Comes From: GNOME’s XDG Desktop Portal (Wayland)</h2>
+
+<p>Wayland restricts screen capture & input injection. Applications must go through the Cross-Desktop “XDG Portal.” GNOME’s backend (<code>xdg-desktop-portal-gnome</code>) implements the actual dialog you see.</p>
+
+<h3>1.1 The Dialog and its “Allow Remote Interaction” Switch (GNOME code)</h3>
+
+<ul>
+  <li>GNOME portal backend (C): <a href="https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/remotedesktopdialog.c#L14-L27">remotedesktopdialog.c (lines 14–27)</a> — constructs and controls dialog state.</li>
+  <li>UI description (GTK/libadwaita): <a href="https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/remotedesktopdialog.ui">remotedesktopdialog.ui</a> — defines widgets including the <em>Allow Remote Interaction</em> switch.</li>
+</ul>
+
+<p>Two details in the GNOME backend are crucial:</p>
+
+<ol>
+  <li><strong>Input devices disabled unless the switch is active.</strong> The device mask (keyboard/mouse/touch) that remote apps receive is <em>empty</em> unless the user turns on <em>Allow Remote Interaction</em>. This is handled inside the dialog logic. (See <a href="https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/remotedesktopdialog.c#L14-L27">remotedesktopdialog.c</a>.)</li>
+  <li><strong>“Share” button inactive until user selects a monitor and/or enables the switch.</strong> The dialog disables “Share” until a shareable target is chosen. Again handled in the same C file and backed by the .ui file’s switch widget.</li>
+</ol>
+
+<p><strong>Net effect:</strong> Absent a persisted authorization that can be restored, a local user must interact with the dialog to grant control.</p>
+
+<hr />
+
+<h2>2) The Portal’s Persistence Model (Why approval seems to “stick” — and why it stops)</h2>
+
+<p>The Wayland Remote Desktop portal is documented at:</p>
+
+<ul>
+  <li><a href="https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html">org.freedesktop.portal.RemoteDesktop</a></li>
+</ul>
+
+<p>Key points from the spec (version 2):</p>
+
+<div class="quote">
+  <p><strong><code>persist_mode</code></strong> — <em>“How this session should persist. 0: no persist, 1: persist while the app runs, 2: persist until explicitly revoked.”</em></p>
+  <p><strong><code>restore_token</code></strong> — <em>“The restore token is <u>invalidated after using it once</u>. To restore the same session again, use the <u>new</u> restore token sent in response to starting this session.”</em></p>
+</div>
+
+<p>So the persistence mechanism is a <em>chain</em> of single-use tokens:</p>
+
+<ol>
+  <li>App calls <code>SelectDevices</code> with <code>persist_mode=2</code> and (optionally) a <code>restore_token</code> from last time.</li>
+  <li>App calls <code>Start</code>. If restoration succeeds, <strong>the portal returns a new <code>restore_token</code></strong> to use next time.</li>
+  <li>The app must <strong>store</strong> this new token immediately. If it fails to do so even once, next unattended connect will try the <em>old</em> (already consumed) token and fail.</li>
+</ol>
+
+<p><strong>This is why your setup sometimes “just dies overnight.”</strong> There is no arbitrary clock-based “expiry” in your app. The token is single-use: if it wasn’t rotated, your next unattended run is dead until someone approves again.</p>
+
+<hr />
+
+<h2>3) How RustDesk Uses Wayland Portals (Where the logic lives)</h2>
+
+<p>RustDesk’s Wayland portal glue code lives in:</p>
+
+<ul>
+  <li><strong>File:</strong> <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs">libs/scrap/src/wayland/pipewire.rs</a></li>
+</ul>
+
+<h3>3.1 Which portal is called? Screencast vs Remote Desktop</h3>
+
+<p>RustDesk decides based on whether the process is running as the <em>server</em>:</p>
+
+<pre><code>// create_session branching
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L592-L600
+if is_server_running() {
+    path = screencast_portal::create_session(&portal, args)?;
+} else {
+    path = remote_desktop_portal::create_session(&portal, args)?;
+}
+
+// start branching
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L818-L823
+if is_server_running() {
+    screencast_portal::start(&portal, &session, handle)?;
+} else {
+    remote_desktop_portal::start(&portal, &session, handle)?;
+}
+</code></pre>
+
+<p>The detection function:</p>
+
+<pre><code>// is_server_running
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L927-L953
+fn is_server_running() -> bool {
+    let app_name = config::APP_NAME.read().unwrap().clone().to_lowercase();
+    let output = Command::new(CMD_SH.as_str()).arg("-c")
+        .arg(&format!("ps aux | grep {}", app_name)).output();
+    let output_str = String::from_utf8_lossy(&output.stdout);
+    output_str.contains(&format!("{} --server", app_name))
+}
+</code></pre>
+
+<p><em>Interpretation:</em> when RustDesk runs as a server on your Ubuntu host, it goes through the Screencast portal for video; when it acts as the remote client, it uses the Remote Desktop portal. Both paths can request persistence; the crucial part is how tokens are handled after a successful start.</p>
+
+<hr />
+
+<h2>4) Where RustDesk Already Handles Persistence (Screencast path)</h2>
+
+<p>On the Screencast (server) branch, RustDesk passes <code>persist_mode=2</code> and an existing token (if stored), then stores the new token it receives. The relevant snippets are:</p>
+
+<pre><code>// Passing persist_mode=2 and restore_token before SelectSources
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L692-L699
+if is_support_restore_token {
+    let restore_token = config::LocalConfig::get_option(RESTORE_TOKEN_CONF_KEY);
+    if !restore_token.is_empty() {
+        args.insert(RESTORE_TOKEN.to_string(), Variant(Box::new(restore_token)));
+    }
+    args.insert("persist_mode".to_string(), Variant(Box::new(2u32)));
+}
+</code></pre>
+
+<pre><code>// Saving the NEW token on Start response (guarded by is_server_running)
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L258-L266
+if is_server_running() {
+    if is_support_restore_token {
+        if let Some(restore_token) = r.results.get(RESTORE_TOKEN) {
+            if let Some(restore_token) = restore_token.as_str() {
+                config::LocalConfig::set_option(
+                    RESTORE_TOKEN_CONF_KEY.to_owned(),
+                    restore_token.to_owned(),
+                );
+            }
+        }
+    }
+}
+</code></pre>
+
+<p><strong>Important nuance:</strong> the “save” lives inside a guard that checks <code>is_server_running()</code>. If for any reason the callback runs when that check is false, the new token won’t be stored — and the next unattended session will try to reuse a stale token.</p>
+
+<hr />
+
+<h2>5) Where Persistence Is Not Implemented (Remote-Desktop branch)</h2>
+
+<p>In the Remote-Desktop (client) branch, RustDesk currently:</p>
+
+<ul>
+  <li>Calls <code>SelectDevices</code> but <strong>does not</strong> add <code>persist_mode</code> nor a <code>restore_token</code> argument there.</li>
+  <li>Calls <code>Start</code> but does <strong>not</strong> store any returned <code>restore_token</code> for next time.</li>
+</ul>
+
+<p>See argument construction for <code>SelectDevices</code> (no persist args):</p>
+
+<pre><code>// Remote-Desktop select_devices args (no persist or restore_token)
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L725-L747
+args.insert("handle_token".to_string(), Variant(Box::new("u2".to_string())));
+args.insert("types".to_string(), Variant(Box::new(7u32))); // all device types
+let path = portal.select_devices(ses.clone(), args)?;
+</code></pre>
+
+<p>And the <code>Start</code> call (no token handling on return):</p>
+
+<pre><code>// Remote-Desktop Start
+// https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L818-L823
+remote_desktop_portal::start(&portal, &session, handle)?;
+</code></pre>
+
+<p><strong>Implication:</strong> even though your machine is in server mode (so you’re on Screencast for video), any path that happens to rely on Remote-Desktop token restoration will not be rotating a token in this branch — and the write-back is also guarded in the Start callback. A single missed rotate leaves you with a dead, single-use token in <code>~/.config/rustdesk/RustDesk_local.toml</code>, which matches the “it died overnight” symptom.</p>
+
+<hr />
+
+<h2>6) Not a Time Expiry: A Setup Timeout vs Token Invalidity</h2>
+
+<p>There is a ~3-minute wait loop for user interaction with the portal dialog; if nobody clicks share within that window, the attempt is aborted. This is <em>not</em> a lifetime expiry — it’s just a setup timeout. (See comments around the waiting code in the same file.)</p>
+
+<ul>
+  <li>Reference: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L188-L194">pipewire.rs:188–194</a></li>
+</ul>
+
+<p>The “overnight stop” you hit is explained by <strong>single-use tokens</strong> + <strong>missed rotation</strong>, not by any clock-based expiration inside RustDesk.</p>
+
+<hr />
+
+<h2>7) Display Topology Changes Force Re-approval</h2>
+
+<p>Even with perfect token rotation, the portal spec states that restoring will be ignored if the stored session no longer matches reality (e.g., the selected monitor no longer exists):</p>
+
+<div class="quote">
+  <p>“If the stored session cannot be restored, this value is ignored and the user will be prompted normally. This may happen when, for example, the session contains a monitor or a window that is not available anymore, or when the stored permissions are withdrawn.” — <a href="https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html#org-freedesktop-portal-RemoteDesktop-SelectDevices">portal docs</a></p>
+</div>
+
+<p>Your EDID/HDMI/DP emulator makes topology stable, but if the dongle is swapped, unplugged, or the compositor’s view of displays changes, the portal can cancel restoration and re-prompt.</p>
+
+<hr />
+
+<h2>8) Your Proven Server-Mode Snapshot</h2>
+
+<p>Your live system shows RustDesk in server mode and a stored token:</p>
+
+<pre><code>$ ps aux | grep -E 'rustdesk(.*--server)?' | grep -v grep
+root       … /usr/bin/rustdesk --service
+user       … /usr/share/rustdesk/rustdesk --server
+user       … /usr/share/rustdesk/rustdesk --tray
+…
+$ grep -n 'wayland-restore-token' ~/.config/rustdesk/RustDesk_local.toml
+12:wayland-restore-token = '322065cd-6e76-4bd6-87b5-527ba8c5bb0f'
+</code></pre>
+
+<p>When the chain is intact, that value changes immediately after a successful unattended start (because the portal returns a new token). If it doesn’t change, the write-back didn’t occur and the next unattended attempt will fail.</p>
+
+<hr />
+
+<h2>9) The “If Only…” (what would need to be different for truly reliable, no-prompt, headless use)</h2>
+
+<p>Given the current upstream code and Wayland/GNOME design, unattended remote control would be truly reliable if only the following were different:</p>
+
+<ol>
+  <li><strong>If only GNOME’s Remote Desktop portal offered a system-wide admin pre-authorization policy</strong> (e.g., “always allow for app X on this machine”), you wouldn’t need per-session, single-use tokens at all. (KDE Plasma has introduced portal pre-authorization; GNOME has not exposed an equivalent admin knob.)</li>
+  <li><strong>If only the portal’s <code>restore_token</code> were multi-use</strong> (or the persisted grant worked without token rotation). The single-use design is what requires the app to save a fresh token <em>every time</em> — any missed write bricks unattended access.</li>
+  <li><strong>If only application code always rotated tokens in every path</strong> (server and remote-desktop branches, and regardless of transient role detection). With guaranteed rotation, a single successful start would never leave you stranded on the next attempt.</li>
+  <li><strong>If only display topology changes didn’t invalidate restoration</strong>. Restoration failing when monitors change is intentional for safety; but for headless servers with fixed EDID stubs, an admin override (“always share Display 0”) would eliminate prompts after reboots or cabling stories.</li>
+</ol>
+
+<p>As things stand, GNOME’s security model (consent per session, single-use tokens, topology checks) plus RustDesk’s current token-handling asymmetry can combine to produce exactly what you’ve seen: <em>it works after one approval, then silently stops later unless everything aligns perfectly</em>.</p>
+
+<hr />
+
+<h2>10) Definitive Links & Code Locations (recap)</h2>
+
+<h3>GNOME (dialog and behavior)</h3>
+<ul>
+  <li>Dialog logic (C): <a href="https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/remotedesktopdialog.c#L14-L27">remotedesktopdialog.c (lines 14–27)</a></li>
+  <li>Dialog UI (GTK/libadwaita): <a href="https://github.com/GNOME/xdg-desktop-portal-gnome/blob/main/src/remotedesktopdialog.ui">remotedesktopdialog.ui</a></li>
+  <li>Portal spec (persistence & tokens): <a href="https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html">org.freedesktop.portal.RemoteDesktop</a></li>
+</ul>
+
+<h3>RustDesk (Wayland portal glue)</h3>
+<ul>
+  <li>Main file: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs">libs/scrap/src/wayland/pipewire.rs</a></li>
+  <li>Create session branching: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L592-L600">L592–L600</a></li>
+  <li>Start branching: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L818-L823">L818–L823</a></li>
+  <li>Server detection heuristic: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L927-L953">L927–L953</a></li>
+  <li>Persist args in Screencast branch: <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L692-L699">L692–L699</a></li>
+  <li>Token save (guarded by <code>is_server_running()</code>): <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L258-L266">L258–L266</a></li>
+  <li>Remote-Desktop <code>SelectDevices</code> args (no persist): <a href="https://raw.githubusercontent.com/rustdesk/rustdesk/master/libs/scrap/src/wayland/pipewire.rs#L725-L747">L725–L747</a></li>
+</ul>
+
+<hr />
+
+<h2>11) What to Watch on Your Server</h2>
+
+<pre><code># 1) Confirm server mode processes exist
+ps aux | grep -E 'rustdesk(.*--server)?' | grep -v grep
+
+# 2) Observe token rotation after a successful (approved) connect
+stat -c '%y  %n' ~/.config/rustdesk/RustDesk_local.toml
+grep -n 'wayland-restore-token' ~/.config/rustdesk/RustDesk_local.toml
+
+# 3) If stuck unattended, clear stale token once (band-aid)
+sed -i '/^wayland-restore-token\s*=/d' ~/.config/rustdesk/RustDesk_local.toml
+</code></pre>
+
+<p>If after a successful start the token value does not change, you’ve hit the missed-rotation condition described above.</p>
+
+<hr />
+
+<h2>12) Closing</h2>
+
+<p>This report documented the complete chain, from GNOME’s enforced consent model and UI, to the XDG portal’s single-use restore tokens, to RustDesk’s current Wayland code paths. Your experience (works once, then dies unattended until a new approval) follows directly from that chain: <em>single-use tokens require perfect rotation on every successful start</em>, and anything that breaks that rotation (or changes the display set) forces a new approval.</p>
+
+<p>As you put it: “If only it didn’t have X, Y, Z, everything would work.” Concretely, “X, Y, Z” are: (X) no admin pre-authorization in GNOME’s portal, (Y) single-use restore tokens that demand constant rotation, (Z) restoration invalidated by display changes. With those constraints removed, unattended Wayland remote control would be as simple as you expect from a headless server.</p>
+
+</body>
+</html>
