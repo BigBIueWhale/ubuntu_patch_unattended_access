@@ -3,11 +3,11 @@
 patch_portal_autoapprove.py
 
 Highly-opinionated, environment-distrusting patcher for GNOME's
-xdg-desktop-portal-gnome (tag 49.0) to:
+xdg-desktop-portal-gnome (tested on 46.2 and 49.0) to:
   1) Auto-approve Remote-Desktop dialog (enable "Allow Remote Interaction", press Share)
   2) Auto-select first output for Screencast when no restore data is available
 
-Targets (MUST match 49.0 layout):
+Targets (must match the known-good layout for your tag; tested on 46.2 and 49.0):
   - src/remotedesktopdialog.c
   - src/screencast.c
 
@@ -15,20 +15,20 @@ Usage:
   python3 patch_portal_autoapprove.py /absolute/path/to/xdg-desktop-portal-gnome
 
 It will:
-  - sanity-check file contents for known sentinels (49.0)
+  - sanity-check file contents for known sentinels (46.2/49.0)
   - create *.bak backups
   - apply minimal, robust edits
   - print a summary diff-ish preview of touched regions
 """
 
-import sys, os, re, textwrap, shutil
+import sys, os, re, textwrap, shutil, subprocess
 
 REQUIRED_FILES = {
     "remotedesktopdialog.c": "src/remotedesktopdialog.c",
     "screencast.c": "src/screencast.c",
 }
 
-# --- Sentinels we expect in 49.0 (fail loudly if not found) ---
+# --- Sentinels we expect for known-good layouts (46.2/49.0). Fail loudly if not found. ---
 SENTINELS = {
     "remotedesktopdialog.c": [
         r"^G_DEFINE_TYPE\s*\(\s*RemoteDesktopDialog\s*,\s*remote_desktop_dialog\s*,\s*ADW_TYPE_WINDOW\s*\)",
@@ -38,7 +38,7 @@ SENTINELS = {
     "screencast.c": [
         r"^static gboolean\s+restore_stream_from_data\s*\(",
         r"^static gboolean\s+handle_start\s*\(",
-        r"^static ScreenCastDialogHandle\s*\*\s*create_screen_cast_dialog\s*\(",
+        r"^static\s+ScreenCastDialogHandle\s*\*\s*create_screen_cast_dialog\s*\(",
         r"^G_DEFINE_TYPE\s*\(\s*ScreenCastSession\s*,\s*screen_cast_session\s*,\s*session_get_type\s*\(\)\s*\)",
     ],
 }
@@ -46,8 +46,8 @@ SENTINELS = {
 def die(msg):
     print(f"\n[ERROR] {msg}\n", file=sys.stderr)
     print("This script is intentionally strict.\n"
-          "• Confirm you checked out the *49.0* sources exactly.\n"
-          "• If you’re on a different version, adapt the patch manually.\n")
+          "• Confirm you checked out the tag selected by tools_portal_tag_probe.py.\n"
+          "• If you’re on a different version/layout, adapt the patch manually.\n")
     sys.exit(1)
 
 def read(path):
@@ -65,8 +65,36 @@ def assert_sentinels(path, content, patterns):
     for pat in patterns:
         if not re.search(pat, content, flags=re.M):
             die(f"Sentinel not found in {path}:\n  pattern: {pat}\n"
-                "File no longer matches expected 49.0 layout.\n"
+                "File does not match the expected layout for supported tags (e.g., 46.2/49.0).\n"
                 "Open the file and verify function names/blocks, then patch manually.")
+
+def detect_tag(root):
+    """Best-effort: print which tag/commit is checked-out (for friendlier logs)."""
+    try:
+        proc = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        if proc.returncode == 0:
+            return proc.stdout.strip()
+        # fall back to short SHA
+        proc2 = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+        if proc2.returncode == 0:
+            return proc2.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 def patch_remotedesktopdialog_c(text):
     """
@@ -120,10 +148,14 @@ def patch_screencast_c(text):
     """
     # 1) Insert helper if missing
     if "OPINIONATED_PATCH_START_FIRST_MONITOR" not in text:
-        insert_after_anchor = r"(static ShellWindow\s*\*\s*find_best_window_by_app_id_and_title\s*\([^)]*\)\s*\{.*?\}\s*)"
+        # Insert AFTER the full definition of screen_cast_stream_info_free(...)
+        # to guarantee the helper can reference it without needing a forward decl.
+        insert_after_anchor = (
+            r"(void\s+screen_cast_stream_info_free\s*\(\s*ScreenCastStreamInfo\s*\*\s*info\s*\)\s*\{.*?\}\s*)"
+        )
         anchor_match = re.search(insert_after_anchor, text, flags=re.S)
         if not anchor_match:
-            die("Could not find anchor after find_best_window_by_app_id_and_title() to insert helper.")
+            die("Could not find anchor after screen_cast_stream_info_free() to insert helper.")
 
         helper = textwrap.dedent(r"""
             /* === OPINIONATED_PATCH_START_FIRST_MONITOR ===
@@ -187,7 +219,10 @@ def patch_screencast_c(text):
     body = hm.group(2)
 
     # Find the branch that creates the dialog when restore fails
-    branch_re = r"if\s*\(!restore_stream_from_data\s*\(\s*screen_cast_session\s*\)\)\s*\{\s*(.*?)\s*\}"
+    # Make this tolerant to spacing and local var naming (e.g., 'session' vs 'screen_cast_session').
+    branch_re = (
+        r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[\w->\s\*]+\)\s*\)\s*\{\s*(.*?)\s*\}"
+    )
     bm = re.search(branch_re, body, flags=re.S)
     if not bm:
         die("Could not find the '!restore_stream_from_data' branch in handle_start().")
@@ -213,6 +248,8 @@ def patch_screencast_c(text):
         /* === /OPINIONATED_PATCH_TRY_FIRST_MONITOR === */
     """).strip("\n")
 
+    # Reconstruct the body with the replaced branch; we keep the explicit variable in the replacement,
+    # since 46.2/49.0 both use `screen_cast_session` inside handle_start.
     new_body = re.sub(branch_re, "if (!restore_stream_from_data (screen_cast_session)) {\n" +
                       replacement_block + "\n}", body, flags=re.S)
 
@@ -221,15 +258,20 @@ def patch_screencast_c(text):
 
 def main():
     if len(sys.argv) != 2:
-        die("Provide the path to your local *49.0* checkout:\n"
+        die("Provide the path to your local checkout of the chosen tag (e.g., 46.2/49.0):\n"
             "  python3 patch_portal_autoapprove.py /path/to/xdg-desktop-portal-gnome")
 
     root = os.path.abspath(sys.argv[1])
+
+    detected = detect_tag(root)
+    if detected:
+        print(f"[info] Detected checkout: {detected}")
+
     for short, rel in REQUIRED_FILES.items():
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
             die(f"Missing required file: {p}\n"
-                "You did not point me at a 49.0 source tree (or tree is incomplete).")
+                "You did not point me at a supported source tree (or tree is incomplete).")
 
     # Validate sentinels
     texts = {}
