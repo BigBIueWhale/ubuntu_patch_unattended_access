@@ -395,15 +395,21 @@ sudo apt upgrade
 
 * **`src/remotedesktopdialog.c`**
 
-  * Adds a small helper `auto_approve_remote_desktop_idle(...)` that:
-
+  * Adds a helper `auto_approve_remote_desktop_idle(...)` that:
     * Turns **“Allow Remote Interaction”** ON.
     * Marks a source as “selected” so **Share** is permitted.
     * Invokes the dialog’s accept handler (**as if Share was clicked**).
-  * Inside `remote_desktop_dialog_new(...)`, schedules that helper with `g_idle_add(...)` instead of clicking immediately. This defers the accept until the dialog is realized and the caller has connected to the `"done"` signal, so the emission is received.
-  * Removes the old “immediate click” injection if it exists (to avoid firing too early).
 
-  **Result:** The consent dialog no longer blocks. It may flash briefly, then auto-dismisses as **Share** is programmatically pressed after realization—yielding reliable unattended approval.
+  * Adds a **mapped-aware** one-shot handler `on_dialog_notify_mapped(...)` that:
+    * Hooks **`notify::mapped`** (fires when the window is actually on-screen).
+    * **Schedules** the helper via `g_timeout_add(120, …)` (≈ one tick later).  
+      This is **non-blocking** and gives callers (TeamViewer/RustDesk) time to connect their “done” signal before we auto-accept.
+
+  * Inside `remote_desktop_dialog_new(...)`, installs this mapping hook:
+    * `g_signal_connect_after(dialog, "notify::mapped", G_CALLBACK(on_dialog_notify_mapped), dialog);`
+    * Removes any old “immediate click” or “idle-only” scheduling blocks if they exist (to avoid double fire).
+
+  **Result:** The consent dialog never blocks. It may flash briefly or not appear, then auto-dismisses **after it’s actually mapped**, and only after a short, non-blocking defer—so the caller reliably receives the “done” reply. This eliminates the “no pop up + connection fails” race.
 
 * **`src/screencast.c`**
 

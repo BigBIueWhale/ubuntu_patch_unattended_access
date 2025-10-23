@@ -5,9 +5,10 @@ patch_portal_autoapprove.py
 Highly-opinionated, environment-distrusting patcher for GNOME's
 xdg-desktop-portal-gnome (tested on 46.2 and 49.0) to:
   1) Auto-approve Remote-Desktop dialog (enable "Allow Remote Interaction", press Share)
-     **but deferred**: we trigger Share on the GTK idle loop so the dialog
-     is realized and the caller is already connected to the "done" signal.
-     This fixes the "window still pops up with switch ON" symptom.
+     **mapped-aware + non-blocking**: we hook after the dialog is actually mapped
+     ("notify::mapped") and then trigger Share via a short GLib timer (~120ms).
+     This guarantees the caller has connected to the "done" signal and avoids the
+     "no popup + no connection" race seen with idle-only scheduling.
   2) Auto-select first output for Screencast when no restore data is available
 
 Targets (must match the known-good layout for your tag; tested on 46.2 and 49.0):
@@ -101,26 +102,29 @@ def detect_tag(root):
 
 # ------------------------------- REMOTEDESKTOP --------------------------------
 
-def _ensure_idle_helper_inserted(text):
+def _ensure_helpers_inserted(text):
     """
-    Ensure our deferred auto-approve helper exists *above* remote_desktop_dialog_new(...).
-    We place it immediately before the function declaration for stability.
+    Ensure our helpers exist *above* remote_desktop_dialog_new(...).
+    We place them immediately before the function declaration for stability.
+      - auto_approve_remote_desktop_idle(...)  (existing)
+      - on_dialog_notify_mapped(...)           (new)
     """
-    if "OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED" in text:
-        return text  # already present
-
-    # Find start of remote_desktop_dialog_new to insert helper right before it.
+    # Find start of remote_desktop_dialog_new to insert helpers right before it.
     new_decl = re.search(r"\n(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{)", text)
     if not new_decl:
-        die("Could not find remote_desktop_dialog_new() declaration to insert idle helper before it.")
+        die("Could not find remote_desktop_dialog_new() declaration to insert helpers before it.")
+    insert_at = new_decl.start(1)
 
-    helper = textwrap.dedent(r"""
+    need_idle = "OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED" not in text
+    need_mapped = "OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER" not in text
+
+    helper_idle = textwrap.dedent(r"""
         /* === OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED ===
-         * We defer the "Share" click until the GTK idle loop so:
+         * We defer the "Share" click until a GLib scheduled callback so:
          *  - The dialog is realized and the **orange Share button** exists.
          *  - External code has already connected to the "done" signal.
          *
-         * Visual effect on the dialog you described:
+         * Visual effect:
          *  - The centered white dialog may flash momentarily (or not be noticeable).
          *  - The **Allow Remote Interaction** toggle is ON.
          *  - The dialog auto-confirms as if **Share** was pressed, so it disappears immediately,
@@ -131,7 +135,7 @@ def _ensure_idle_helper_inserted(text):
         {
           RemoteDesktopDialog *dialog = REMOTE_DESKTOP_DIALOG (user_data);
 
-          /* Turn ON the permission toggle you see in the first row (orange track + white knob). */
+          /* Turn ON the permission toggle in the first row. */
           adw_switch_row_set_active (dialog->allow_remote_interaction_switch, TRUE);
 
           /* Satisfy accept gating even if no screen cast selection has happened yet. */
@@ -139,7 +143,7 @@ def _ensure_idle_helper_inserted(text):
 
           /*
            * Now we "press" the bright orange **Share** button.
-           * Because this happens on idle, the parent has already connected to "done",
+           * Because this runs after mapping, the parent has already connected to "done",
            * so the emission is received and the dialog closes instead of lingering.
            */
           button_clicked (GTK_WIDGET (dialog->accept_button), dialog);
@@ -149,32 +153,73 @@ def _ensure_idle_helper_inserted(text):
         /* === /OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED === */
     """).strip("\n") + "\n\n"
 
-    insert_at = new_decl.start(1)
-    return text[:insert_at] + helper + text[insert_at:]
+    helper_mapped = textwrap.dedent(r"""
+        /* === OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER ===
+         * Runs once when the dialog becomes mapped (actually on-screen), then defers
+         * auto-approve by ~120ms so the caller has connected its "done" handler.
+         * Non-blocking: this schedules a timer; it does not sleep the main loop.
+         */
+        static void
+        on_dialog_notify_mapped (GObject *obj, GParamSpec *pspec, gpointer user_data)
+        {
+          GtkWidget *w = GTK_WIDGET (obj);
+          /* Only proceed after the dialog is really mapped */
+          if (!gtk_widget_get_mapped (w))
+            return;
+
+          /* Disconnect ourselves so we only run once */
+          g_signal_handlers_disconnect_by_func (obj, G_CALLBACK (on_dialog_notify_mapped), user_data);
+
+          /* Defer one tick; callers like TeamViewer/RustDesk will have their handlers connected */
+          g_timeout_add (120, (GSourceFunc) auto_approve_remote_desktop_idle, user_data);
+        }
+        /* === /OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER === */
+    """).strip("\n") + "\n\n"
+
+    # Build insertion text in correct order (idle first, then mapped handler)
+    insertion = ""
+    if need_idle:
+        insertion += helper_idle
+    if need_mapped:
+        insertion += helper_mapped
+
+    if not insertion:
+        return text  # nothing to do
+
+    return text[:insert_at] + insertion + text[insert_at:]
 
 
-def _remove_old_immediate_block(body):
+def _strip_previous_schedule_blocks(body):
     """
-    If a previous run injected the "immediate click" block (OPINIONATED_PATCH_AUTO_APPROVE),
-    remove it so we don't click too early (before signals/realize).
+    Remove any previous scheduling blocks we might have injected in older versions:
+      - Immediate click block (OPINIONATED_PATCH_AUTO_APPROVE)
+      - Idle scheduler block (OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE)
     """
-    pattern = re.compile(
+    patt_immediate = re.compile(
         r"/\*\s*===\s*OPINIONATED_PATCH_AUTO_APPROVE\s*===.*?/\*\s*===\s*/OPINIONATED_PATCH_AUTO_APPROVE\s*===\s*\*/",
         re.S
     )
-    return re.sub(pattern, "", body)
+    patt_idle = re.compile(
+        r"/\*\s*===\s*OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE\s*===.*?/\*\s*===\s*/OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE\s*===\s*\*/",
+        re.S
+    )
+    body = re.sub(patt_immediate, "", body)
+    body = re.sub(patt_idle, "", body)
+    return body
 
 
 def patch_remotedesktopdialog_c(text):
     """
-    Strategy (deferred accept):
-      - Insert static gboolean auto_approve_remote_desktop_idle(...) helper.
-      - In remote_desktop_dialog_new(...), schedule it with g_idle_add(...)
+    Strategy (mapped-aware accept):
+      - Insert static helpers:
+          * auto_approve_remote_desktop_idle(...)   (kept as the "do it" action)
+          * on_dialog_notify_mapped(...)            (new, hooks notify::mapped then defers ~120ms)
+      - In remote_desktop_dialog_new(...), connect notify::mapped handler
         right before 'return dialog;'.
-      - Remove any older "immediate click" injection to avoid early emission.
+      - Remove any older scheduler injections (immediate/idle) to avoid double fire.
     """
-    # 1) Ensure the idle helper is present above the constructor
-    text = _ensure_idle_helper_inserted(text)
+    # 1) Ensure helpers are present above the constructor
+    text = _ensure_helpers_inserted(text)
 
     # 2) Locate constructor body
     func_re = r"(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{\s*)(.*?)(\n\s*return\s+dialog;\s*\})"
@@ -184,26 +229,25 @@ def patch_remotedesktopdialog_c(text):
 
     prefix, body, suffix = m.group(1), m.group(2), m.group(3)
 
-    # 3) Remove any previous "immediate" block if present
-    body = _remove_old_immediate_block(body)
+    # 3) Remove any previous schedule blocks
+    body = _strip_previous_schedule_blocks(body)
 
-    # 4) Avoid double scheduling
-    if "g_idle_add (auto_approve_remote_desktop_idle, dialog);" in body:
-        # already patched with deferred approach
+    # 4) Avoid double scheduling with the new approach
+    if "OPINIONATED_PATCH_SCHEDULE_ON_MAPPED" in body or "on_dialog_notify_mapped" in body and "notify::mapped" in body:
+        # already patched with mapped-aware approach
         return text
 
-    # 5) Inject the deferred schedule call just before return
+    # 5) Inject the mapped hook just before return
     inject = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE ===
-         * Schedule auto-approve on the GTK idle loop.
-         *
-         * Visual impact:
-         *  - If the dialog becomes visible at all, it will *immediately* dismiss itself.
-         *  - You will not have to click **Share** (orange button) nor choose monitors in the grid.
-         *  - The toggle **Allow Remote Interaction** is programmatically set to ON right before accept.
+        /* === OPINIONATED_PATCH_SCHEDULE_ON_MAPPED ===
+         * Schedule auto-approve only after the dialog is mapped (visible).
+         * Then defer by ~120ms on the main loop to avoid early "done" races.
          */
-        g_idle_add (auto_approve_remote_desktop_idle, dialog);
-        /* === /OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE === */
+        g_signal_connect_after (dialog,
+                                "notify::mapped",
+                                G_CALLBACK (on_dialog_notify_mapped),
+                                dialog);
+        /* === /OPINIONATED_PATCH_SCHEDULE_ON_MAPPED === */
     """).strip("\n")
 
     new_body = body.rstrip() + "\n\n  " + inject + "\n"
@@ -234,7 +278,7 @@ def patch_screencast_c(text):
              * Try to auto-pick the first logical monitor as a Screencast source.
              * Returns TRUE if session successfully started.
              *
-             * Visual effect on the dialog you described:
+             * Visual effect:
              *   - When Screencast would normally show a monitor grid, we auto-select the first
              *     tile (your “LG 24\"” in the example) and proceed, so the chooser usually won’t appear.
              */
@@ -364,7 +408,7 @@ def main():
         assert_sentinels(p, s, SENTINELS[short])
         texts[short] = (p, s)
 
-    # Patch remotedesktopdialog.c (deferred auto-approve)
+    # Patch remotedesktopdialog.c (mapped-aware auto-approve)
     rpath, rtext = texts["remotedesktopdialog.c"]
     rpatched = patch_remotedesktopdialog_c(rtext)
 
