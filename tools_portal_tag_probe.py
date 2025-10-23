@@ -221,7 +221,7 @@ def _cli(argv: Optional[Iterable[str]] = None) -> int:
                 "tag": result.tag,
                 "repo": os.path.abspath(args.repo),
             }))
-        elif args.print-tag:
+        elif args.print_tag:
             print(result.tag)
         else:
             print(f"\n✅ Compatible tag: {result.tag}")
