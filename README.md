@@ -2,12 +2,17 @@
 
 This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.04 LTS (Noble)** with **GNOME on Wayland** and the **GNOME xdg-desktop-portal backend**.
 
-> **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` (tag **49.0**) so that:
+> **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` so that:
 >
 > * **Remote-Desktop** is **auto-approved** with **“Allow Remote Interaction”** enabled (no consent dialog).
 > * **Screencast** auto-selects the **first monitor** when there’s no valid restore data (no chooser).
 >
 > Use only on machines you own/administer. This intentionally bypasses a security prompt.
+
+> **How we pick the correct portal version:** We no longer tell you to manually choose a tag or guess a version.
+> The included **`tools_portal_tag_probe.py`** discovers the newest upstream **release tag** that actually **configures with Meson on *your* machine**, then (optionally) checks it out. In practice it will try tags from **49.0** downward until a match is found — commonly **✅ Compatible tag: 46.2** on Ubuntu 24.04 — which avoids configure-time dependency errors like:
+>
+> `subprojects/libgxdp/meson.build:9:10: ERROR: Dependency lookup for gtk4 with method 'pkgconfig' failed: Invalid version, need 'gtk4' ['>= 4.17.1'] found '4.14.5'.`
 
 ---
 
@@ -68,34 +73,49 @@ sudo apt build-dep -y xdg-desktop-portal-gnome
 **Expect:** Packages get installed. If you still see “You must put some 'deb-src' URIs…”, re-check Step 5 and confirm `Types: deb deb-src` exists in `/etc/apt/sources.list.d/ubuntu.sources`.
 
 ```bash
-# 8) Fetch upstream sources locally inside the project and lock to the exact tag we patch against.
-mkdir -p ./sources && cd ./sources && git clone https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome.git && cd xdg-desktop-portal-gnome && git fetch --tags && git checkout 49.0 && git describe --tags --exact-match
+# 8) Make a local place for upstream sources (kept under the project).
+mkdir -p ./sources
 ```
 
-**Expect:** The last command prints exactly `49.0`. If it doesn’t, you’re not on the required tag — don’t continue.
+**Expect:** A `sources/` directory appears under the project.
 
 ```bash
-# 9) Apply this repo’s patcher from the project root — validates layout and edits only what’s needed.
-cd ../../ && python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
+# 9) Auto-detect the newest upstream *compatible* tag and check it out locally.
+#    This will clone the portal repo into ./sources/xdg-desktop-portal-gnome if missing,
+#    fetch tags, probe them from newest to oldest, print the chosen tag, and check it out.
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --checkout --print-tag
 ```
 
-**Expect:** Lines like `[OK] Patched …remotedesktopdialog.c` and `[OK] Patched …screencast.c`. If you see `[ERROR] Sentinel not found`, your sources are not exactly 49.0.
+**Expect:** A single line with the chosen tag (e.g., `46.2`) and the repo at `./sources/xdg-desktop-portal-gnome` now checked out at that tag.
+If no compatible tag is found, the script will explain recent failures (GTK requirements, etc.). You can add `--show-failures` for a brief summary.
 
 ```bash
-# 10) Build the project with Meson/Ninja — produces the patched binaries under ./sources/.../build.
+# 10) Apply this repo’s patcher — validates layout and edits only what’s needed.
+python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
+```
+
+**Expect:** Lines like `[OK] Patched …remotedesktopdialog.c` and `[OK] Patched …screencast.c`.
+If you see `[ERROR] Sentinel not found`, the checked-out sources **don’t match the expected layout** for this patcher. See the **Patcher layout note** below.
+
+```bash
+# 11) Build the project with Meson/Ninja — produces the patched binaries under ./sources/.../build.
 cd ./sources/xdg-desktop-portal-gnome && meson setup build --prefix=/usr --buildtype=release && ninja -C build
 ```
 
 **Expect:** Meson detects your system and finishes with “Build targets in project: …”. Ninja compiles without errors.
 
 ```bash
-# 11) Install and restart user portal services — switches your session to the patched backend.
+# 12) Install and restart user portal services — switches your session to the patched backend.
 systemctl --user stop xdg-desktop-portal-gnome.service xdg-desktop-portal.service && sudo ninja -C build install && systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal-gnome.service xdg-desktop-portal.service
 ```
 
 **Expect:** Both services come back as “active (running)”. See verification below if you want to double-check.
 
-If the `git describe` check or the patcher fails, you’re not on **49.0**. Fix that before proceeding.
+> **Patcher layout note:** The patcher is intentionally strict and was authored against the 49.0 file layout.
+> Many 46.x/49.x releases share the same relevant regions; if they diverge, the script will refuse with a clear sentinel error so you don’t accidentally patch the wrong code. If your **auto-detected** tag doesn’t match, either:
+>
+> * upgrade your toolchain so a newer tag configures (e.g., newer GTK), **or**
+> * adapt the patch manually to the checked-out tag (open the files listed in the error and apply the same logical changes).
 
 ---
 
@@ -125,7 +145,7 @@ dpkg -s xdg-desktop-portal | grep '^Version'
 dpkg -s xdg-desktop-portal-gnome | grep '^Version'
 ```
 
-**Expect:** A `49.x` series version string (distro package; we’ll build from tag 49.0 next).
+**Expect:** A `49.x` or `46.x` series version string (distro package; we will build from an upstream tag chosen by the probe).
 
 Portal backend must be **GNOME**:
 
@@ -167,12 +187,12 @@ After following the steps below, your tree will look like:
 ubuntu_patch_unattended_access/
 ├── patch_portal_autoapprove.py
 ├── README.md
-├── remote_access_wayland_reality.html
+├── tools_portal_tag_probe.py
 └── sources/
-    └── xdg-desktop-portal-gnome/   # upstream sources at tag 49.0
+    └── xdg-desktop-portal-gnome/   # upstream sources at an auto-detected compatible tag
 ```
 
-**Expect:** The `sources/xdg-desktop-portal-gnome` directory contains the GNOME Git clone fixed at tag `49.0`.
+**Expect:** The `sources/xdg-desktop-portal-gnome` directory contains the GNOME Git clone fixed at the tag chosen by the probe (often `46.2` on Ubuntu 24.04, otherwise the newest one your toolchain supports).
 
 ---
 
@@ -220,15 +240,22 @@ sudo apt build-dep -y xdg-desktop-portal-gnome
 
 ---
 
-## 3) Fetch Upstream Sources (locked to **49.0**) — Project-Local
+## 3) Fetch Upstream Sources (auto-chosen tag) — Project-Local
 
-Why: The patcher uses **strict sentinels** that match *exactly* what’s in tag 49.0. Building from any other tag or distro branch may fail or produce different behavior.
+Why: The probe script discovers a tag that **configures** with your installed toolchain (GTK, libadwaita, etc.), eliminating guesswork and avoiding Meson errors.
 
 ```bash
-mkdir -p ./sources && cd ./sources && git clone https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome.git && cd xdg-desktop-portal-gnome && git fetch --tags && git checkout 49.0 && git describe --tags --exact-match && cd ../../
+mkdir -p ./sources
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --checkout --print-tag
 ```
 
-**Expect:** The final `git describe` prints `49.0`. If it doesn’t, do not proceed.
+**Expect:** It prints a tag like `46.2` and checks out that tag in `./sources/xdg-desktop-portal-gnome`.
+If you prefer a machine-readable output: `--json`. For brief reasons why newer tags failed: add `--show-failures`.
+
+> **Why this matters:** Ubuntu 24.04 typically ships GTK4 **4.14.x**, while some newer portal tags require **>= 4.17.1**. The probe will naturally skip those and pick a compatible release (e.g., **46.2**) so that:
+>
+> `meson setup build --prefix=/usr --buildtype=release`
+> does **not** fail with a GTK version error.
 
 ---
 
@@ -242,16 +269,15 @@ python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
 
 **Expect:**
 
-* Verifies the **49.0** layout using strict sentinels.
-
+* Verifies the expected layout using strict sentinels.
 * Creates backups:
 
   * `sources/xdg-desktop-portal-gnome/src/remotedesktopdialog.c.bak`
   * `sources/xdg-desktop-portal-gnome/src/screencast.c.bak`
-
 * Prints `[OK] Patched ...` (or `[SKIP] ... already patched`)
 
-If you get `[ERROR]` about sentinels/layout, the sources are not **exactly 49.0**. Fix the checkout before proceeding.
+If you get `[ERROR]` about sentinels/layout, the checked-out tag’s code doesn’t exactly match what the patcher expects.
+See the **Patcher layout note** in the Quick Start for options.
 
 ---
 
@@ -313,7 +339,7 @@ journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-page
 
 ## 7) What Exactly Changes (Code-Level Summary)
 
-* **`src/remotedesktopdialog.c` (49.0)**
+* **`src/remotedesktopdialog.c`**
 
   * Inside `remote_desktop_dialog_new(...)`:
 
@@ -323,7 +349,7 @@ journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-page
 
   **Result:** No consent dialog for Remote-Desktop; unattended approval.
 
-* **`src/screencast.c` (49.0)**
+* **`src/screencast.c`**
 
   * Adds `start_first_monitor(ScreenCastSession*)` to select the **first logical monitor** and call `start_session(...)`.
   * In `handle_start(...)`: if `restore_stream_from_data(...)` fails, attempts unattended **first-monitor** start before falling back to the chooser.
@@ -397,7 +423,7 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 ## 12) References
 
 * Upstream project: [https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome](https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome)
-* Tag used: **49.0**
+* Tag used: **auto-detected by `tools_portal_tag_probe.py`** (often chooses **46.2** on Ubuntu 24.04 due to GTK constraints; otherwise the newest compatible tag)
 * Files affected:
 
   * `src/remotedesktopdialog.c`
@@ -408,8 +434,31 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 ### Troubleshooting
 
 * **Backend mismatch:** Ensure **GNOME** owns `org.freedesktop.impl.portal.desktop.gnome`.
-* **Wrong sources:** `git -C ./sources/xdg-desktop-portal-gnome describe --tags` should print **49.0**.
+* **Probe picked a tag but Meson still fails:** Make sure you *built* in a fresh `build/` (`meson setup build --wipe ...`) and that you actually ran the probe with `--checkout`.
+* **GTK version error (e.g., needs >= 4.17.1 but found 4.14.5):** That’s exactly what the probe avoids; rerun Step 3 to ensure you used the chosen tag (commonly **46.2** on Ubuntu 24.04).
+* **Patcher sentinel error:** The target tag’s file layout differs from what the patcher expects. Either upgrade your toolchain so a newer tag configures that matches the layout, or patch manually following the comments in `patch_portal_autoapprove.py`.
 * **Missing deps:** Re-run Section 2; then `meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build`.
 * **Portal logs:** `journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-pager` to inspect startup and requests.
 * **App still prompts:** Confirm the request goes through **xdg-desktop-portal** (visible in logs) and that the GNOME backend is in use (not KDE/wlr).
-* **`apt build-dep` still complains about deb-src:** Re-open `/etc/apt/sources.list.d/ubuntu.sources`, confirm `Types: deb deb-src` appears, run `sudo apt update`, then retry `sudo apt build-dep -y xdg-desktop-portal-gnome`. If you changed mirrors, make sure the `URIs:` entries are valid for your region.
+
+---
+
+### Appendix: Using the Tag Probe Tool Directly
+
+The probe has a small CLI you can use for scripting:
+
+```bash
+# Print just the chosen tag (machine-friendly):
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --print-tag
+
+# Check out the chosen tag after discovery (also prints it, if you add --print-tag):
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --checkout --print-tag
+
+# Emit JSON with the chosen tag and repo path:
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --json
+
+# Show brief reasons why newer tags failed Meson setup (e.g., GTK/libadwaita requirements):
+python3 ./tools_portal_tag_probe.py --repo ./sources/xdg-desktop-portal-gnome --show-failures
+```
+
+These commands are optional; the main flow already uses the probe to remove any manual tag selection.
