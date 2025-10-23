@@ -103,7 +103,7 @@ If you see `[ERROR] Sentinel not found`, the checked-out sources **don’t match
 
 ```bash
 # 11) Build the project with Meson/Ninja — produces the patched binaries under ./sources/.../build.
-cd ./sources/xdg-desktop-portal-gnome && meson setup build --prefix=/usr --buildtype=release && ninja -C build
+cd ./sources/xdg-desktop-portal-gnome && meson setup --wipe build --prefix=/usr --buildtype=release && ninja -C build
 ```
 
 **Expect:** Meson detects your system and finishes with “Build targets in project: …”. Ninja compiles without errors.
