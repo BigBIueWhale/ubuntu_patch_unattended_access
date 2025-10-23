@@ -111,8 +111,8 @@ systemctl --user stop xdg-desktop-portal-gnome.service xdg-desktop-portal.servic
 
 **Expect:** Both services come back as “active (running)”. See verification below if you want to double-check.
 
-> **Patcher layout note:** The patcher is intentionally strict and was authored against the 49.0 file layout.
-> Many 46.x/49.x releases share the same relevant regions; if they diverge, the script will refuse with a clear sentinel error so you don’t accidentally patch the wrong code. If your **auto-detected** tag doesn’t match, either:
+> **Patcher layout note:** The patcher is intentionally strict and was authored against the 46.2 / 49.0 file layout.
+> 46.2/49.0 releases share the same relevant regions; if the auto-selected version diverges, the script will refuse with a clear sentinel error so you don’t accidentally patch the wrong code. If your **auto-detected** tag doesn’t match, either:
 >
 > * upgrade your toolchain so a newer tag configures (e.g., newer GTK), **or**
 > * adapt the patch manually to the checked-out tag (open the files listed in the error and apply the same logical changes).
