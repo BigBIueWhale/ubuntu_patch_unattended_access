@@ -144,18 +144,16 @@ def patch_screencast_c(text):
       - Add a small static helper 'start_first_monitor(...)' that builds a single-monitor stream and calls start_session().
       - In handle_start(...): after '!restore_stream_from_data(...)', try start_first_monitor(); only if THAT fails, fall back to the chooser dialog.
 
-      We insert the helper above 'handle_start' and modify the 'if (!restore_stream_from_data ...)' block.
+      We insert the helper **above 'handle_start'** (more robust than anchoring after the _free() function),
+      and modify the 'if (!restore_stream_from_data ...)' block with a resilient pattern.
     """
     # 1) Insert helper if missing
     if "OPINIONATED_PATCH_START_FIRST_MONITOR" not in text:
-        # Insert AFTER the full definition of screen_cast_stream_info_free(...)
-        # to guarantee the helper can reference it without needing a forward decl.
-        insert_after_anchor = (
-            r"(void\s+screen_cast_stream_info_free\s*\(\s*ScreenCastStreamInfo\s*\*\s*info\s*\)\s*\{.*?\}\s*)"
-        )
-        anchor_match = re.search(insert_after_anchor, text, flags=re.S)
-        if not anchor_match:
-            die("Could not find anchor after screen_cast_stream_info_free() to insert helper.")
+        # Find the beginning of handle_start() and insert the helper right before it.
+        handle_decl_re = r"\n(static\s+gboolean\s+handle_start\s*\([^)]*\)\s*\{)"
+        hd = re.search(handle_decl_re, text, flags=re.S)
+        if not hd:
+            die("Could not find handle_start() declaration to insert helper before it.")
 
         helper = textwrap.dedent(r"""
             /* === OPINIONATED_PATCH_START_FIRST_MONITOR ===
@@ -207,21 +205,20 @@ def patch_screencast_c(text):
             /* === /OPINIONATED_PATCH_START_FIRST_MONITOR === */
         """).strip("\n")
 
-        idx = anchor_match.end(1)
-        text = text[:idx] + "\n\n" + helper + "\n\n" + text[idx:]
+        insert_at = hd.start(1)
+        text = text[:insert_at] + "\n\n" + helper + "\n\n" + text[insert_at:]
 
     # 2) Modify handle_start flow
-    handle_re = r"(static gboolean\s+handle_start\s*\([^)]*\)\s*\{\s*)(.*?)(\n\}\s*)"
+    handle_re = r"(static\s+gboolean\s+handle_start\s*\([^)]*\)\s*\{\s*)(.*?)(\n\}\s*)"
     hm = re.search(handle_re, text, flags=re.S)
     if not hm:
         die("Could not locate handle_start() body for patching in screencast.c.")
 
     body = hm.group(2)
 
-    # Find the branch that creates the dialog when restore fails
-    # Make this tolerant to spacing and local var naming (e.g., 'session' vs 'screen_cast_session').
+    # Robustly find the restore branch: match any argument list inside (...) with [^)]*
     branch_re = (
-        r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[\w->\s\*]+\)\s*\)\s*\{\s*(.*?)\s*\}"
+        r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[^)]*\)\s*\)\s*\{\s*(.*?)\s*\}"
     )
     bm = re.search(branch_re, body, flags=re.S)
     if not bm:
@@ -248,10 +245,15 @@ def patch_screencast_c(text):
         /* === /OPINIONATED_PATCH_TRY_FIRST_MONITOR === */
     """).strip("\n")
 
-    # Reconstruct the body with the replaced branch; we keep the explicit variable in the replacement,
-    # since 46.2/49.0 both use `screen_cast_session` inside handle_start.
-    new_body = re.sub(branch_re, "if (!restore_stream_from_data (screen_cast_session)) {\n" +
-                      replacement_block + "\n}", body, flags=re.S)
+    # Normalize the whole branch to use screen_cast_session explicitly (46.2/49.0 both use it)
+    new_body = re.sub(
+        branch_re,
+        "if (!restore_stream_from_data (screen_cast_session)) {\n"
+        + replacement_block +
+        "\n}",
+        body,
+        flags=re.S
+    )
 
     text = text[:hm.start(2)] + new_body + text[hm.end(2):]
     return text
