@@ -115,6 +115,22 @@ systemctl --user stop xdg-desktop-portal-gnome.service xdg-desktop-portal.servic
 
 **Expect:** Both services come back as “active (running)”. See verification below if you want to double-check.
 
+```bash
+# 13) Prevent upgrades from overwriting your patched portal (recommended).
+sudo apt-mark hold xdg-desktop-portal-gnome
+
+# (Later, to allow updates again)
+# sudo apt-mark unhold xdg-desktop-portal-gnome
+```
+
+**Expect:** `xdg-desktop-portal-gnome` shows up in `apt-mark showhold`.
+
+(Optional quick check:)
+
+```bash
+apt-mark showhold | grep -x 'xdg-desktop-portal-gnome' && echo "Hold active"
+```
+
 > **Patcher layout note:** The patcher is intentionally strict and was authored against the 46.2 / 49.0 file layout.
 > 46.2/49.0 releases share the same relevant regions; if the auto-selected version diverges, the script will refuse with a clear sentinel error so you don’t accidentally patch the wrong code. If your **auto-detected** tag doesn’t match, either:
 >
@@ -341,7 +357,41 @@ journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-page
 
 ---
 
-## 7) What Exactly Changes (Code-Level Summary)
+## 7) Keep Your Patch Across APT Upgrades (apt-mark hold)
+
+**Why:** A standard `sudo apt upgrade` will replace your locally installed, patched
+`xdg-desktop-portal-gnome` with the distro’s package the next time it’s updated.
+APT/dpkg does not treat your `/usr` install as a “local modification.”
+
+**Solution (simple): hold the package.**
+
+```bash
+# Prevent upgrades from overwriting the patched portal backend
+sudo apt-mark hold xdg-desktop-portal-gnome
+````
+
+**Verify the hold:**
+
+```bash
+apt-mark showhold | grep -x 'xdg-desktop-portal-gnome' && echo "Hold active"
+```
+
+**Unhold later (to take updates or to rebuild/reinstall your patch):**
+
+```bash
+sudo apt-mark unhold xdg-desktop-portal-gnome
+# then update/upgrade as usual
+sudo apt update
+sudo apt upgrade
+```
+
+> ⚠️ **Trade-off:** While on hold, you will not receive security/bug-fix updates for
+> `xdg-desktop-portal-gnome`. When you’re ready, `unhold`, let it upgrade, then
+> re-apply/rebuild your patch (Sections 3–6), and `hold` again if desired.
+
+---
+
+## 8) What Exactly Changes (Code-Level Summary)
 
 * **`src/remotedesktopdialog.c`**
 
@@ -364,7 +414,7 @@ journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-page
 
 ---
 
-## 8) Testing
+## 9) Testing
 
 Why: Validates behavior at runtime.
 
@@ -382,7 +432,7 @@ journalctl --user -fu xdg-desktop-portal-gnome -u xdg-desktop-portal
 
 ---
 
-## 9) Rollback (Return to Stock)
+## 10) Rollback (Return to Stock)
 
 **Option A — Reinstall distro package**
 
@@ -414,19 +464,19 @@ sudo mv /etc/apt/sources.list.d/ubuntu.sources.bak /etc/apt/sources.list.d/ubunt
 
 ---
 
-## 10) Notes on Restore Tokens & Persistence
+## 11) Notes on Restore Tokens & Persistence
 
 Wayland portals use **single-use** restore tokens. Well-behaved apps rotate them after each success. This patch **bypasses** the consent path and **auto-shares the first monitor**, preventing “stale token → prompt” loops from blocking unattended operation. If an app never reaches the portal start flow, that’s outside the portal’s scope.
 
 ---
 
-## 11) Security & Responsibility
+## 12) Security & Responsibility
 
 This removes a user consent step that GNOME ships intentionally. Apply only on systems you control with explicit authorization to allow unattended access. Keep machines physically secure and restrict who can start remote-desktop clients.
 
 ---
 
-## 12) References
+## 13) References
 
 * Upstream project: [https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome](https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome)
 * Tag used: **auto-detected by `tools_portal_tag_probe.py`** (often chooses **46.2** on Ubuntu 24.04 due to GTK constraints; otherwise the newest compatible tag)
