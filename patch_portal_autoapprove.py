@@ -219,44 +219,89 @@ def patch_remotedesktopdialog_c(text):
     body_new = re.sub(anchor_re, lambda m: m.group(0) + "\n\n  " + inject + "\n", body, count=1)
     return text[:m.start(2)] + body_new + text[m.end(2):]
 
-# --------------------------- screencastwidget.c --------------------------------
+# --------------------------- screencastwidget.c (STRICT) -----------------------
 
 def patch_screencastwidget_c(text):
     """
-    In update_monitor_container(ScreenCastWidget *widget):
-      - Replace the inline 'singular' CSS if/else block with:
-          int child_count = ...;
-          singular CSS toggle;
-          auto-select first monitor if (child_count > 0 && !widget->allow_multiple).
+    STRICT mode:
+      Accept exactly one layout for update_monitor_container(ScreenCastWidget *widget):
+        1) A local 'child_count' declaration calling
+           screen_cast_geometry_container_get_child_count(SCREEN_CAST_GEOMETRY_CONTAINER(monitor_container));
+        2) Immediately followed by:
+             if (child_count == 1) { gtk_widget_add_css_class(monitor_container, "singular"); }
+             else                  { gtk_widget_remove_css_class(monitor_container, "singular"); }
+
+      We then replace ONLY the if/else block with a version that also
+      auto-selects the first monitor when single-selection is enforced.
+
+      Any deviation → abort with a verbose error (no fallbacks).
     """
+    # Locate the function body strictly
     func_re = r"(static\s+void\s+update_monitor_container\s*\(\s*ScreenCastWidget\s*\*widget\s*\)\s*\{\s*)(.*?)(\n\}\s*)"
     m = re.search(func_re, text, flags=re.S)
     if not m:
-        die("Could not locate update_monitor_container() body for patching in screencastwidget.c.",
-            "screencastwidget.c")
+        die(
+            "update_monitor_container(): function not found.\n"
+            "Expected exact signature:\n"
+            "  static void update_monitor_container (ScreenCastWidget *widget)\n",
+            "screencastwidget.c"
+        )
 
-    body = m.group(2)
+    prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+
     if AUTO_FIRST_MONITOR_TAG in body:
-        return text  # already patched
+        # Already patched; in STRICT mode we still allow re-runs to be idempotent.
+        return text
 
-    child_count_if_re = (
-        r"if\s*\(\s*screen_cast_geometry_container_get_child_count\s*\(\s*SCREEN_CAST_GEOMETRY_CONTAINER\s*\(\s*monitor_container\s*\)\s*\)\s*==\s*1\s*\)\s*\{\s*"
+    # STRICT sentinel 1: exact child_count declaration
+    child_decl_re = (
+        r"\bint\s+child_count\s*=\s*"
+        r"screen_cast_geometry_container_get_child_count\s*\(\s*"
+        r"SCREEN_CAST_GEOMETRY_CONTAINER\s*\(\s*monitor_container\s*\)\s*"
+        r"\)\s*;\s*"
+    )
+    child_decl_match = re.search(child_decl_re, body)
+    if not child_decl_match:
+        die(
+            "update_monitor_container(): STRICT check failed.\n"
+            "Reason: Expected local declaration:\n"
+            "  int child_count = screen_cast_geometry_container_get_child_count ("
+            "SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));\n"
+            "immediately before the 'singular' CSS toggle.\n",
+            "screencastwidget.c"
+        )
+
+    # STRICT sentinel 2: exact if/else on child_count toggling 'singular'
+    singular_if_block_re = (
+        r"if\s*\(\s*child_count\s*==\s*1\s*\)\s*\{\s*"
         r"gtk_widget_add_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
         r"\}\s*else\s*\{\s*"
         r"gtk_widget_remove_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
         r"\}"
     )
+    if not re.search(singular_if_block_re, body):
+        die(
+            "update_monitor_container(): STRICT check failed.\n"
+            "Reason: Expected exact block toggling 'singular' based on child_count:\n"
+            "  if (child_count == 1) {\n"
+            "    gtk_widget_add_css_class (monitor_container, \"singular\");\n"
+            "  } else {\n"
+            "    gtk_widget_remove_css_class (monitor_container, \"singular\");\n"
+            "  }\n"
+            "This shape is required for the opinionated patch.\n",
+            "screencastwidget.c"
+        )
 
-    replacement = textwrap.dedent(f"""
-        int child_count = screen_cast_geometry_container_get_child_count (SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));
+    # Replacement: keep the preceding child_count declaration intact; replace ONLY the if/else
+    replacement_if_block = textwrap.dedent(f"""
         if (child_count == 1)
           gtk_widget_add_css_class (monitor_container, "singular");
         else
           gtk_widget_remove_css_class (monitor_container, "singular");
 
         /* === {AUTO_FIRST_MONITOR_TAG} ===
-         * For truly unattended use: auto-select the first monitor when present
-         * and single-selection is enforced.
+         * STRICT patch: auto-select the first monitor when present
+         * and multiple selection is NOT allowed.
          */
         if (child_count > 0 && !widget->allow_multiple)
           {{
@@ -267,15 +312,11 @@ def patch_screencastwidget_c(text):
         /* === /{AUTO_FIRST_MONITOR_TAG} === */
     """).strip("\n")
 
-    if not re.search(child_count_if_re, body, flags=re.S):
-        die(
-            "update_monitor_container(): expected inline 'singular' CSS toggle block not found.\n"
-            "This patch relies on the 46.2/49.0 structure that toggles 'singular' based on\n"
-            "screen_cast_geometry_container_get_child_count(...).",
-            "screencastwidget.c"
-        )
+    new_body = re.sub(singular_if_block_re, replacement_if_block, body, count=1)
 
-    new_body = re.sub(child_count_if_re, replacement, body, flags=re.S, count=1)
+    # Final sanity: ensure we didn’t accidentally duplicate tags
+    assert AUTO_FIRST_MONITOR_TAG in new_body
+
     return text[:m.start(2)] + new_body + text[m.end(2):]
 
 # ------------------------------- utilities ------------------------------------
