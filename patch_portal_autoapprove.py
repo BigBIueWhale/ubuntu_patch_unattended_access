@@ -223,20 +223,23 @@ def patch_remotedesktopdialog_c(text):
 
 def patch_screencastwidget_c(text):
     """
-    STRICT mode:
-      Accept exactly one layout for update_monitor_container(ScreenCastWidget *widget):
-        1) A local 'child_count' declaration calling
-           screen_cast_geometry_container_get_child_count(SCREEN_CAST_GEOMETRY_CONTAINER(monitor_container));
-        2) Immediately followed by:
-             if (child_count == 1) { gtk_widget_add_css_class(monitor_container, "singular"); }
-             else                  { gtk_widget_remove_css_class(monitor_container, "singular"); }
+    PROCEDURAL + STRICT:
+      We accept either of two known layouts for update_monitor_container(ScreenCastWidget *widget):
+        A) STRICT layout we authored for (preferred):
+           - Local 'int child_count = screen_cast_geometry_container_get_child_count(SCREEN_CAST_GEOMETRY_CONTAINER(monitor_container));'
+           - Followed immediately by the 'singular' CSS toggle using 'child_count'.
+        B) 46.2 inline layout (upstream):
+           - The 'singular' CSS toggle calls get_child_count(...) *inline* in the if-condition.
 
-      We then replace ONLY the if/else block with a version that also
-      auto-selects the first monitor when single-selection is enforced.
+      Behavior:
+        • If already patched (tag present) → return text unchanged (idempotent).
+        • If STRICT (A) → replace ONLY the if/else block, inject our auto-select block.
+        • If inline (B) → FIRST rewrite into STRICT (insert the local declaration + strict toggle),
+                          THEN apply the same replacement + injection.
+        • Anything else → die() with a *specific* and *actionable* error message.
 
-      Any deviation → abort with a verbose error (no fallbacks).
+      We *never* patch unless all preconditions match exactly.
     """
-    # Locate the function body strictly
     func_re = r"(static\s+void\s+update_monitor_container\s*\(\s*ScreenCastWidget\s*\*widget\s*\)\s*\{\s*)(.*?)(\n\}\s*)"
     m = re.search(func_re, text, flags=re.S)
     if not m:
@@ -249,50 +252,36 @@ def patch_screencastwidget_c(text):
 
     prefix, body, suffix = m.group(1), m.group(2), m.group(3)
 
+    # Guard: already patched?
     if AUTO_FIRST_MONITOR_TAG in body:
-        # Already patched; in STRICT mode we still allow re-runs to be idempotent.
-        return text
+        return text  # idempotent
 
-    # STRICT sentinel 1: exact child_count declaration
-    child_decl_re = (
+    # Canonical fragments we rely on
+    decl_exact = (
         r"\bint\s+child_count\s*=\s*"
         r"screen_cast_geometry_container_get_child_count\s*\(\s*"
         r"SCREEN_CAST_GEOMETRY_CONTAINER\s*\(\s*monitor_container\s*\)\s*"
         r"\)\s*;\s*"
     )
-    child_decl_match = re.search(child_decl_re, body)
-    if not child_decl_match:
-        die(
-            "update_monitor_container(): STRICT check failed.\n"
-            "Reason: Expected local declaration:\n"
-            "  int child_count = screen_cast_geometry_container_get_child_count ("
-            "SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));\n"
-            "immediately before the 'singular' CSS toggle.\n",
-            "screencastwidget.c"
-        )
 
-    # STRICT sentinel 2: exact if/else on child_count toggling 'singular'
-    singular_if_block_re = (
+    toggle_strict_block = (
         r"if\s*\(\s*child_count\s*==\s*1\s*\)\s*\{\s*"
         r"gtk_widget_add_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
         r"\}\s*else\s*\{\s*"
         r"gtk_widget_remove_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
         r"\}"
     )
-    if not re.search(singular_if_block_re, body):
-        die(
-            "update_monitor_container(): STRICT check failed.\n"
-            "Reason: Expected exact block toggling 'singular' based on child_count:\n"
-            "  if (child_count == 1) {\n"
-            "    gtk_widget_add_css_class (monitor_container, \"singular\");\n"
-            "  } else {\n"
-            "    gtk_widget_remove_css_class (monitor_container, \"singular\");\n"
-            "  }\n"
-            "This shape is required for the opinionated patch.\n",
-            "screencastwidget.c"
-        )
 
-    # Replacement: keep the preceding child_count declaration intact; replace ONLY the if/else
+    # Variant B: inline get_child_count(...) inside the if condition (46.2 upstream shape)
+    toggle_inline_block = (
+        r"if\s*\(\s*screen_cast_geometry_container_get_child_count\s*\(\s*"
+        r"SCREEN_CAST_GEOMETRY_CONTAINER\s*\(\s*monitor_container\s*\)\s*\)\s*==\s*1\s*\)\s*"
+        r"gtk_widget_add_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
+        r"else\s*"
+        r"gtk_widget_remove_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;"
+    )
+
+    # The block we want to replace the toggle with (strict form) + our injection
     replacement_if_block = textwrap.dedent(f"""
         if (child_count == 1)
           gtk_widget_add_css_class (monitor_container, "singular");
@@ -312,12 +301,134 @@ def patch_screencastwidget_c(text):
         /* === /{AUTO_FIRST_MONITOR_TAG} === */
     """).strip("\n")
 
-    new_body = re.sub(singular_if_block_re, replacement_if_block, body, count=1)
+    # 1) Try STRICT path first: declaration + strict toggle present
+    decl_match = re.search(decl_exact, body)
+    strict_toggle_match = re.search(toggle_strict_block, body)
 
-    # Final sanity: ensure we didn’t accidentally duplicate tags
-    assert AUTO_FIRST_MONITOR_TAG in new_body
+    if decl_match and strict_toggle_match:
+        # Sanity: ensure decl is immediately before the toggle (no arbitrary code between),
+        # allowing whitespace/comments. We enforce "close proximity" to avoid false positives.
+        intervening = body[decl_match.end():strict_toggle_match.start()]
+        if re.search(r"[^\s/\*]", intervening):  # anything other than whitespace/comments?
+            die(
+                "update_monitor_container(): STRICT check failed.\n"
+                "Reason: The expected 'child_count' declaration is not immediately before the\n"
+                "'singular' CSS toggle. Our opinionated patch requires that layout to avoid\n"
+                "rewriting unrelated code. Compare to upstream 46.2/49.0.\n",
+                "screencastwidget.c"
+            )
 
-    return text[:m.start(2)] + new_body + text[m.end(2):]
+        # Replace only the toggle block (keep the declaration intact)
+        new_body = re.sub(toggle_strict_block, replacement_if_block, body, count=1)
+        assert AUTO_FIRST_MONITOR_TAG in new_body
+        return text[:m.start(2)] + new_body + text[m.end(2):]
+
+    # 2) Try INLINE shape: rewrite to STRICT, then apply the same replacement
+    inline_match = re.search(toggle_inline_block, body)
+    if inline_match:
+        # Ensure we don't already have a child_count declaration; we will insert exactly one.
+        if re.search(r"\bint\s+child_count\b", body):
+            die(
+                "update_monitor_container(): Found inline 'singular' toggle *and* an existing\n"
+                "'child_count' variable. This mixed state is unexpected. Please normalize the\n"
+                "toggle to either (A) strict local 'child_count' usage or (B) pure inline call.\n"
+                "Refusing to guess which one to transform.",
+                "screencastwidget.c"
+            )
+
+        # We will transform the inline toggle into:
+        #    int child_count = get_child_count(...);
+        #    if (child_count == 1) { add CSS } else { remove CSS }
+        #
+        # To do so, we:
+        #  - splice in the declaration immediately *before* the inline if/else
+        #  - replace the inline if/else with the strict toggle using 'child_count'
+        #
+        # First, build the declaration text.
+        decl_text = (
+            "int child_count = screen_cast_geometry_container_get_child_count ("
+            "SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));\n\n"
+        )
+
+        # Insert the declaration just before the inline block
+        body_with_decl = body[:inline_match.start()] + decl_text + body[inline_match.start():]
+
+        # Now replace the inline if/else (we must recompute match on the updated body)
+        inline_match_2 = re.search(toggle_inline_block, body_with_decl)
+        if not inline_match_2:
+            # This would be extremely strange unless the source changed after insertion
+            die(
+                "update_monitor_container(): Internal transform error while normalizing inline\n"
+                "toggle to strict form. After inserting the local 'child_count' declaration, the\n"
+                "expected inline toggle was not found at the previous location. Aborting to avoid\n"
+                "corrupting the file.",
+                "screencastwidget.c"
+            )
+
+        # Replace inline with strict block (WITHOUT our injection yet)
+        strict_toggle_only = (
+            "if (child_count == 1) {\n"
+            '  gtk_widget_add_css_class (monitor_container, "singular");\n'
+            "} else {\n"
+            '  gtk_widget_remove_css_class (monitor_container, "singular");\n'
+            "}"
+        )
+        body_strict = (
+            body_with_decl[:inline_match_2.start()] +
+            strict_toggle_only +
+            body_with_decl[inline_match_2.end():]
+        )
+
+        # Verify we now have EXACTLY the strict shape we expect (decl + strict toggle)
+        decl_match2 = re.search(decl_exact, body_strict)
+        strict_toggle_match2 = re.search(toggle_strict_block, body_strict)
+        if not (decl_match2 and strict_toggle_match2):
+            die(
+                "update_monitor_container(): Normalization step failed.\n"
+                "We attempted to rewrite the inline 'singular' toggle into the strict layout\n"
+                "(local 'child_count' + strict if/else), but the post-transform body did not\n"
+                "match our expected strict sentinel. No changes were written.",
+                "screencastwidget.c"
+            )
+
+        # Ensure declaration is adjacent to the toggle (only whitespace/comments allowed)
+        intervening2 = body_strict[decl_match2.end():strict_toggle_match2.start()]
+        if re.search(r"[^\s/\*]", intervening2):
+            die(
+                "update_monitor_container(): Normalization produced unexpected code between\n"
+                "the 'child_count' declaration and the strict toggle. Our patch expects them\n"
+                "to be adjacent. Aborting to avoid unsafe rewrite.",
+                "screencastwidget.c"
+            )
+
+        # Finally, apply our injection by replacing the strict toggle with replacement_if_block
+        new_body = re.sub(toggle_strict_block, replacement_if_block, body_strict, count=1)
+        assert AUTO_FIRST_MONITOR_TAG in new_body
+        return text[:m.start(2)] + new_body + text[m.end(2):]
+
+    # 3) Neither strict nor inline shapes detected → explain precisely what we expected
+    # Provide a focused hint: show lines that reference 'singular' or get_child_count(...) near end of function
+    tail = body[-800:]  # last ~800 chars to avoid flooding
+    singular_spots = []
+    for m2 in re.finditer(r"(singular|screen_cast_geometry_container_get_child_count)", tail):
+        start = max(0, m2.start() - 120)
+        end = min(len(tail), m2.end() + 120)
+        snippet = tail[start:end].replace("\n", "\\n")
+        singular_spots.append(f"...{snippet}...")
+
+    details = "\n  - " + "\n  - ".join(singular_spots) if singular_spots else " (no nearby references found)"
+    die(
+        "update_monitor_container(): STRICT/INLINE shape not recognized.\n"
+        "We require either:\n"
+        "  A) Local 'int child_count = screen_cast_geometry_container_get_child_count(SCREEN_CAST_GEOMETRY_CONTAINER(monitor_container));'\n"
+        "     immediately followed by the 'singular' CSS toggle using 'child_count';\n"
+        "  OR\n"
+        "  B) An inline 'singular' CSS toggle that calls get_child_count(...) directly in the if.\n"
+        "\n"
+        "Your function body does not match either pattern. Here are the closest hints near the end of the function:\n"
+        f"{details}\n",
+        "screencastwidget.c"
+    )
 
 # ------------------------------- utilities ------------------------------------
 
