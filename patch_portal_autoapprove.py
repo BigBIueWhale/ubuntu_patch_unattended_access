@@ -2,390 +2,307 @@
 """
 patch_portal_autoapprove.py
 
-Highly-opinionated, environment-distrusting patcher for GNOME's
-xdg-desktop-portal-gnome (tested on 46.2 and 49.0) to:
-  1) Auto-approve Remote-Desktop dialog (enable "Allow Remote Interaction", press Share)
-     **mapped-aware + non-blocking**: we hook after the dialog is actually mapped
-     ("notify::mapped") and then trigger Share via a short GLib timer (~120ms).
-     This guarantees the caller has connected to the "done" signal and avoids the
-     "no popup + no connection" race seen with idle-only scheduling.
-  2) Auto-select first output for Screencast when no restore data is available
+Strict, mapped-aware + idle-fallback patcher for GNOME's xdg-desktop-portal-gnome
+to allow truly unattended Remote Desktop consent + first-monitor auto-selection.
 
-Targets (must match the known-good layout for your tag; tested on 46.2 and 49.0):
+Guarantees:
+  • The consent dialog is auto-accepted even if the monitor grid hasn't populated.
+  • Works when the window is mapped (notify::mapped) AND also via an idle fallback.
+
+Targets (validated against tags 46.2 and 49.0):
   - src/remotedesktopdialog.c
-  - src/screencast.c
+  - src/screencastwidget.c
+
+If anything does not match the expected layout, this script fails loudly and prints
+canonical upstream links to compare.
 
 Usage:
   python3 patch_portal_autoapprove.py /absolute/path/to/xdg-desktop-portal-gnome
 
-It will:
-  - sanity-check file contents for known sentinels (46.2/49.0)
-  - create *.bak backups
-  - apply minimal, robust edits
-  - print a summary diff-ish preview of touched regions
+This script:
+  - Checks for required files
+  - Validates "sentinel" structures
+  - REFUSES TO RUN if any *.bak already exists (to protect prior backups)
+  - Writes *.bak once, then patches the files
+  - Prints a short diff-like preview of the touched regions
 """
 
-import sys, os, re, textwrap, shutil, subprocess
+import sys, os, re, textwrap, shutil, subprocess, difflib
 
 REQUIRED_FILES = {
     "remotedesktopdialog.c": "src/remotedesktopdialog.c",
-    "screencast.c": "src/screencast.c",
+    "screencastwidget.c":    "src/screencastwidget.c",
 }
 
-# --- Sentinels we expect for known-good layouts (46.2/49.0). Fail loudly if not found. ---
+# --- Sentinels for known-good layouts (46.2 / 49.0). ---
 SENTINELS = {
     "remotedesktopdialog.c": [
         r"^G_DEFINE_TYPE\s*\(\s*RemoteDesktopDialog\s*,\s*remote_desktop_dialog\s*,\s*ADW_TYPE_WINDOW\s*\)",
+        r"^static void\s+button_clicked\s*\(\s*GtkWidget\s*\*button,\s*.*?RemoteDesktopDialog\s*\*dialog\)",
+        r"^static void\s+update_button_sensitivity\s*\(\s*RemoteDesktopDialog\s*\*dialog\)",
         r"^RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\(",
-        r"^static void\s+button_clicked\s*\(\s*GtkWidget\s*\*button,\s*",
+        r"^static void\s+remote_desktop_dialog_init\s*\(\s*RemoteDesktopDialog\s*\*dialog\)",
     ],
-    "screencast.c": [
-        r"^static gboolean\s+restore_stream_from_data\s*\(",
-        r"^static gboolean\s+handle_start\s*\(",
-        r"^static\s+ScreenCastDialogHandle\s*\*\s*create_screen_cast_dialog\s*\(",
-        r"^G_DEFINE_TYPE\s*\(\s*ScreenCastSession\s*,\s*screen_cast_session\s*,\s*session_get_type\s*\(\)\s*\)",
+    "screencastwidget.c": [
+        r"^G_DEFINE_TYPE\s*\(\s*ScreenCastWidget\s*,\s*screen_cast_widget\s*,\s*GTK_TYPE_BOX\s*\)",
+        r"^static void\s+update_monitor_container\s*\(\s*ScreenCastWidget\s*\*widget\)",
+        r"^static void\s+screen_cast_widget_init\s*\(\s*ScreenCastWidget\s*\*widget\)",
     ],
 }
 
-def die(msg):
+HELP_LINKS = {
+    "remotedesktopdialog.c": [
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/46.2/src/remotedesktopdialog.c",
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/49.0/src/remotedesktopdialog.c",
+    ],
+    "screencastwidget.c": [
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/46.2/src/screencastwidget.c",
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/49.0/src/screencastwidget.c",
+    ],
+}
+
+# Tags for injected blocks
+AUTO_HELPERS_TAG = "OPINIONATED_PATCH_AUTO_SHARE_HELPERS"
+MAPPED_SCHEDULE_TAG = "OPINIONATED_PATCH_SCHEDULE_ON_MAPPED"
+AUTO_FIRST_MONITOR_TAG = "OPINIONATED_PATCH_AUTO_SELECT_FIRST_MONITOR"
+
+def die(msg, filekey=None):
     print(f"\n[ERROR] {msg}\n", file=sys.stderr)
-    print("This script is intentionally strict.\n"
-          "• Confirm you checked out the tag selected by tools_portal_tag_probe.py.\n"
-          "• If you’re on a different version/layout, adapt the patch manually.\n")
+    if filekey and filekey in HELP_LINKS:
+        print("Compare against the upstream layout here:", file=sys.stderr)
+        for url in HELP_LINKS[filekey]:
+            print(f"  - {url}", file=sys.stderr)
+    print("\nThis script is intentionally strict.\n"
+          "• Confirm you checked out a supported tag (e.g., 46.2 / 49.0).\n"
+          "• If you’re on a different version/layout, adapt the patch manually.\n", file=sys.stderr)
     sys.exit(1)
+
+def detect_tag(root):
+    """Best-effort: identify checked-out tag or SHA for friendlier logs."""
+    try:
+        p = subprocess.run(
+            ["git", "describe", "--tags", "--exact-match"],
+            cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5
+        )
+        if p.returncode == 0:
+            return p.stdout.strip()
+        p2 = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=root, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5
+        )
+        if p2.returncode == 0:
+            return p2.stdout.strip()
+    except Exception:
+        pass
+    return None
 
 def read(path):
     with open(path, "r", encoding="utf-8") as f:
         return f.read()
 
-def write_backup_then(path, new_text):
+def write_with_backup(path, new_text):
     backup = path + ".bak"
-    if not os.path.exists(backup):
-        shutil.copy2(path, backup)
+    if os.path.exists(backup):
+        die(f"Backup already exists: {backup}\n"
+            "To protect your previous backup, this run aborts.\n"
+            "Move/rename the existing .bak and re-run.", None)
+    shutil.copy2(path, backup)
     with open(path, "w", encoding="utf-8") as f:
         f.write(new_text)
 
-def assert_sentinels(path, content, patterns):
+def assert_sentinels(path, content, patterns, filekey):
     for pat in patterns:
-        if not re.search(pat, content, flags=re.M):
+        if not re.search(pat, content, flags=re.M | re.S):
             die(f"Sentinel not found in {path}:\n  pattern: {pat}\n"
-                "File does not match the expected layout for supported tags (e.g., 46.2/49.0).\n"
-                "Open the file and verify function names/blocks, then patch manually.")
+                "File does not match the expected layout for supported tags (46.2/49.0).",
+                filekey=filekey)
 
-def detect_tag(root):
-    """Best-effort: print which tag/commit is checked-out (for friendlier logs)."""
-    try:
-        proc = subprocess.run(
-            ["git", "describe", "--tags", "--exact-match"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        if proc.returncode == 0:
-            return proc.stdout.strip()
-        # fall back to short SHA
-        proc2 = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            cwd=root,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        )
-        if proc2.returncode == 0:
-            return proc2.stdout.strip()
-    except Exception:
-        pass
-    return None
+# -------------------------- remotedesktopdialog.c -----------------------------
 
-# ------------------------------- REMOTEDESKTOP --------------------------------
+def _insert_remotedesktop_helpers(text):
+    """Insert helpers BEFORE remote_desktop_dialog_init()."""
+    if AUTO_HELPERS_TAG in text:
+        return text
 
-def _ensure_helpers_inserted(text):
-    """
-    Ensure our helpers exist *above* remote_desktop_dialog_new(...).
-    We place them immediately before the function declaration for stability.
-      - auto_approve_remote_desktop_idle(...)  (existing)
-      - on_dialog_notify_mapped(...)           (new)
-    """
-    # Find start of remote_desktop_dialog_new to insert helpers right before it.
-    new_decl = re.search(r"\n(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{)", text)
-    if not new_decl:
-        die("Could not find remote_desktop_dialog_new() declaration to insert helpers before it.")
-    insert_at = new_decl.start(1)
+    init_decl = re.search(
+        r"\n(static\s+void\s+remote_desktop_dialog_init\s*\(\s*RemoteDesktopDialog\s*\*dialog\s*\)\s*\{)",
+        text
+    )
+    if not init_decl:
+        die("Could not find remote_desktop_dialog_init() to anchor helper insertion.", "remotedesktopdialog.c")
 
-    need_idle = "OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED" not in text
-    need_mapped = "OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER" not in text
-
-    helper_idle = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED ===
-         * We defer the "Share" click until a GLib scheduled callback so:
-         *  - The dialog is realized and the **orange Share button** exists.
-         *  - External code has already connected to the "done" signal.
-         *
-         * Visual effect:
-         *  - The centered white dialog may flash momentarily (or not be noticeable).
-         *  - The **Allow Remote Interaction** toggle is ON.
-         *  - The dialog auto-confirms as if **Share** was pressed, so it disappears immediately,
-         *    skipping the screen/monitor grid selection UI you described ("LG 24\"" vs "Telecom 23\"").
+    # NEVER mode: force selection TRUE + mapped-aware + idle fallback (idle added later)
+    helpers = textwrap.dedent(f"""
+        /* === {AUTO_HELPERS_TAG} ===
+         * Auto-Share: ensure selection is considered present, enable "Allow Remote Interaction",
+         * refresh sensitivity, then click Share. This is used by both the mapped hook and idle fallback.
          */
         static gboolean
-        auto_approve_remote_desktop_idle (gpointer user_data)
-        {
-          RemoteDesktopDialog *dialog = REMOTE_DESKTOP_DIALOG (user_data);
-
-          /* Turn ON the permission toggle in the first row. */
-          adw_switch_row_set_active (dialog->allow_remote_interaction_switch, TRUE);
-
-          /* Satisfy accept gating even if no screen cast selection has happened yet. */
+        auto_share_response (RemoteDesktopDialog *dialog)
+        {{
+          /* Treat Screencast as selected to guarantee Share is permitted. */
           dialog->is_screen_cast_sources_selected = TRUE;
 
-          /*
-           * Now we "press" the bright orange **Share** button.
-           * Because this runs after mapping, the parent has already connected to "done",
-           * so the emission is received and the dialog closes instead of lingering.
-           */
-          button_clicked (GTK_WIDGET (dialog->accept_button), dialog);
+          /* Turn ON the permission toggle so Share becomes allowed. */
+          adw_switch_row_set_active (dialog->allow_remote_interaction_switch, TRUE);
+
+          /* Ensure accept button sensitivity re-evaluates */
+          update_button_sensitivity (dialog);
+
+          /* Programmatically press the bright orange "Share" button. */
+          g_signal_emit_by_name (dialog->accept_button, "clicked");
 
           return G_SOURCE_REMOVE; /* run once */
-        }
-        /* === /OPINIONATED_PATCH_AUTO_APPROVE_DEFERRED === */
-    """).strip("\n") + "\n\n"
+        }}
 
-    helper_mapped = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER ===
-         * Runs once when the dialog becomes mapped (actually on-screen), then defers
-         * auto-approve by ~120ms so the caller has connected its "done" handler.
-         * Non-blocking: this schedules a timer; it does not sleep the main loop.
-         */
         static void
         on_dialog_notify_mapped (GObject *obj, GParamSpec *pspec, gpointer user_data)
-        {
+        {{
           GtkWidget *w = GTK_WIDGET (obj);
-          /* Only proceed after the dialog is really mapped */
           if (!gtk_widget_get_mapped (w))
             return;
 
-          /* Disconnect ourselves so we only run once */
+          /* Run only once */
           g_signal_handlers_disconnect_by_func (obj, G_CALLBACK (on_dialog_notify_mapped), user_data);
 
-          /* Defer one tick; callers like TeamViewer/RustDesk will have their handlers connected */
-          g_timeout_add (120, (GSourceFunc) auto_approve_remote_desktop_idle, user_data);
-        }
-        /* === /OPINIONATED_PATCH_AUTO_APPROVE_MAPPED_HANDLER === */
+          /* Defer slightly so external code has its "done" handlers connected. */
+          g_timeout_add (120, (GSourceFunc) auto_share_response, user_data);
+        }}
+        /* === /{AUTO_HELPERS_TAG} === */
     """).strip("\n") + "\n\n"
 
-    # Build insertion text in correct order (idle first, then mapped handler)
-    insertion = ""
-    if need_idle:
-        insertion += helper_idle
-    if need_mapped:
-        insertion += helper_mapped
-
-    if not insertion:
-        return text  # nothing to do
-
-    return text[:insert_at] + insertion + text[insert_at:]
-
-
-def _strip_previous_schedule_blocks(body):
-    """
-    Remove any previous scheduling blocks we might have injected in older versions:
-      - Immediate click block (OPINIONATED_PATCH_AUTO_APPROVE)
-      - Idle scheduler block (OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE)
-    """
-    patt_immediate = re.compile(
-        r"/\*\s*===\s*OPINIONATED_PATCH_AUTO_APPROVE\s*===.*?/\*\s*===\s*/OPINIONATED_PATCH_AUTO_APPROVE\s*===\s*\*/",
-        re.S
-    )
-    patt_idle = re.compile(
-        r"/\*\s*===\s*OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE\s*===.*?/\*\s*===\s*/OPINIONATED_PATCH_SCHEDULE_DEFERRED_APPROVE\s*===\s*\*/",
-        re.S
-    )
-    body = re.sub(patt_immediate, "", body)
-    body = re.sub(patt_idle, "", body)
-    return body
-
+    insert_at = init_decl.start(1)
+    return text[:insert_at] + helpers + text[insert_at:]
 
 def patch_remotedesktopdialog_c(text):
     """
-    Strategy (mapped-aware accept):
-      - Insert static helpers:
-          * auto_approve_remote_desktop_idle(...)   (kept as the "do it" action)
-          * on_dialog_notify_mapped(...)            (new, hooks notify::mapped then defers ~120ms)
-      - In remote_desktop_dialog_new(...), connect notify::mapped handler
-        right before 'return dialog;'.
-      - Remove any older scheduler injections (immediate/idle) to avoid double fire.
+    1) Insert helpers above remote_desktop_dialog_init().
+    2) In remote_desktop_dialog_init(), right after gtk_widget_init_template(GTK_WIDGET(dialog));
+       install BOTH:
+         - mapped-aware notify::mapped hook -> on_dialog_notify_mapped
+         - idle fallback -> g_idle_add(auto_share_response, dialog)
     """
-    # 1) Ensure helpers are present above the constructor
-    text = _ensure_helpers_inserted(text)
+    text = _insert_remotedesktop_helpers(text)
 
-    # 2) Locate constructor body
-    func_re = r"(RemoteDesktopDialog\s*\*\s*remote_desktop_dialog_new\s*\([^)]*\)\s*\{\s*)(.*?)(\n\s*return\s+dialog;\s*\})"
+    func_re = r"(static\s+void\s+remote_desktop_dialog_init\s*\(\s*RemoteDesktopDialog\s*\*dialog\s*\)\s*\{\s*)(.*?)(\n\}\s*)"
     m = re.search(func_re, text, flags=re.S)
     if not m:
-        die("Could not locate remote_desktop_dialog_new body for patching.")
+        die("Could not locate remote_desktop_dialog_init() body for patching.", "remotedesktopdialog.c")
 
     prefix, body, suffix = m.group(1), m.group(2), m.group(3)
 
-    # 3) Remove any previous schedule blocks
-    body = _strip_previous_schedule_blocks(body)
+    anchor_re = r"gtk_widget_init_template\s*\(\s*GTK_WIDGET\s*\(\s*dialog\s*\)\s*\)\s*;"
+    if not re.search(anchor_re, body):
+        die("remote_desktop_dialog_init(): expected gtk_widget_init_template(GTK_WIDGET(dialog)); not found.",
+            "remotedesktopdialog.c")
 
-    # 4) Avoid double scheduling with the new approach
-    if "OPINIONATED_PATCH_SCHEDULE_ON_MAPPED" in body or "on_dialog_notify_mapped" in body and "notify::mapped" in body:
-        # already patched with mapped-aware approach
+    if (MAPPED_SCHEDULE_TAG in body) or ("notify::mapped" in body and "on_dialog_notify_mapped" in body):
+        # If previous version exists but without idle fallback, add idle fallback if missing.
+        if "g_idle_add" not in body:
+            body_new = re.sub(anchor_re, lambda m: m.group(0) + "\n\n  g_idle_add ((GSourceFunc) auto_share_response, dialog);\n", body, count=1)
+            return text[:m.start(2)] + body_new + text[m.end(2):]
         return text
 
-    # 5) Inject the mapped hook just before return
-    inject = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_SCHEDULE_ON_MAPPED ===
-         * Schedule auto-approve only after the dialog is mapped (visible).
-         * Then defer by ~120ms on the main loop to avoid early "done" races.
+    inject = textwrap.dedent(f"""
+        /* === {MAPPED_SCHEDULE_TAG} ===
+         * Schedule auto-share after the dialog is mapped, and also schedule an idle fallback.
          */
         g_signal_connect_after (dialog,
                                 "notify::mapped",
                                 G_CALLBACK (on_dialog_notify_mapped),
                                 dialog);
-        /* === /OPINIONATED_PATCH_SCHEDULE_ON_MAPPED === */
+        /* Idle fallback: if mapped notify never arrives, still auto-approve */
+        g_idle_add ((GSourceFunc) auto_share_response, dialog);
+        /* === /{MAPPED_SCHEDULE_TAG} === */
     """).strip("\n")
 
-    new_body = body.rstrip() + "\n\n  " + inject + "\n"
-    patched = text[:m.start(2)] + new_body + text[m.end(2):]
-    return patched
+    body_new = re.sub(anchor_re, lambda m: m.group(0) + "\n\n  " + inject + "\n", body, count=1)
+    return text[:m.start(2)] + body_new + text[m.end(2):]
 
-# -------------------------------- SCREENCAST ----------------------------------
+# --------------------------- screencastwidget.c --------------------------------
 
-def patch_screencast_c(text):
+def patch_screencastwidget_c(text):
     """
-    Strategy:
-      - Add a small static helper 'start_first_monitor(...)' that builds a single-monitor stream and calls start_session().
-      - In handle_start(...): after '!restore_stream_from_data(...)', try start_first_monitor(); only if THAT fails, fall back to the chooser dialog.
-
-      We insert the helper **above 'handle_start'** (more robust than anchoring after the _free() function),
-      and modify the 'if (!restore_stream_from_data ...)' block with a resilient pattern.
+    In update_monitor_container(ScreenCastWidget *widget):
+      - Replace the inline 'singular' CSS if/else block with:
+          int child_count = ...;
+          singular CSS toggle;
+          auto-select first monitor if (child_count > 0 && !widget->allow_multiple).
     """
-    # 1) Insert helper if missing
-    if "OPINIONATED_PATCH_START_FIRST_MONITOR" not in text:
-        # Find the beginning of handle_start() and insert the helper right before it.
-        handle_decl_re = r"\n(static\s+gboolean\s+handle_start\s*\([^)]*\)\s*\{)"
-        hd = re.search(handle_decl_re, text, flags=re.S)
-        if not hd:
-            die("Could not find handle_start() declaration to insert helper before it.")
+    func_re = r"(static\s+void\s+update_monitor_container\s*\(\s*ScreenCastWidget\s*\*widget\s*\)\s*\{\s*)(.*?)(\n\}\s*)"
+    m = re.search(func_re, text, flags=re.S)
+    if not m:
+        die("Could not locate update_monitor_container() body for patching in screencastwidget.c.",
+            "screencastwidget.c")
 
-        helper = textwrap.dedent(r"""
-            /* === OPINIONATED_PATCH_START_FIRST_MONITOR ===
-             * Try to auto-pick the first logical monitor as a Screencast source.
-             * Returns TRUE if session successfully started.
-             *
-             * Visual effect:
-             *   - When Screencast would normally show a monitor grid, we auto-select the first
-             *     tile (your “LG 24\"” in the example) and proceed, so the chooser usually won’t appear.
-             */
-            static gboolean
-            start_first_monitor (ScreenCastSession *screen_cast_session)
-            {
-              DisplayStateTracker *dst = display_state_tracker_get ();
-              GList *l;
-
-              for (l = display_state_tracker_get_logical_monitors (dst); l; l = l->next)
-                {
-                  LogicalMonitor *lm = l->data;
-                  GList *monitors = logical_monitor_get_monitors (lm);
-                  if (monitors)
-                    {
-                      Monitor *m = monitor_dup ((Monitor *)monitors->data);
-
-                      ScreenCastStreamInfo *info = g_new0 (ScreenCastStreamInfo, 1);
-                      info->type = SCREEN_CAST_SOURCE_TYPE_MONITOR;
-                      info->data.monitor = m;
-                      info->id = 1;
-
-                      GPtrArray *arr =
-                        g_ptr_array_new_with_free_func ((GDestroyNotify) screen_cast_stream_info_free);
-                      g_ptr_array_add (arr, info);
-
-                      /* Ensure selection flags are sane */
-                      screen_cast_session->select.multiple = FALSE;
-                      screen_cast_session->select.source_types.monitor = TRUE;
-
-                      g_autoptr(GError) error = NULL;
-                      if (!start_session (screen_cast_session, arr, &error))
-                        {
-                          if (error)
-                            g_warning ("Failed to start first-monitor session: %s", error->message);
-                          /* arr is owned by start_session on success; free on failure */
-                          g_ptr_array_unref (arr);
-                          return FALSE;
-                        }
-
-                      return TRUE;
-                    }
-                }
-              return FALSE;
-            }
-            /* === /OPINIONATED_PATCH_START_FIRST_MONITOR === */
-        """).strip("\n")
-
-        insert_at = hd.start(1)
-        text = text[:insert_at] + "\n\n" + helper + "\n\n" + text[insert_at:]
-
-    # 2) Modify handle_start flow
-    handle_re = r"(static\s+gboolean\s+handle_start\s*\([^)]*\)\s*\{\s*)(.*?)(\n\}\s*)"
-    hm = re.search(handle_re, text, flags=re.S)
-    if not hm:
-        die("Could not locate handle_start() body for patching in screencast.c.")
-
-    body = hm.group(2)
-
-    # Robustly find the restore branch
-    branch_re = (r"if\s*\(\s*!\s*restore_stream_from_data\s*\(\s*[^)]*\)\s*\)\s*\{\s*(.*?)\s*\}")
-    bm = re.search(branch_re, body, flags=re.S)
-    if not bm:
-        die("Could not find the '!restore_stream_from_data' branch in handle_start().")
-
-    branch_block = bm.group(1)
-    if "OPINIONATED_PATCH_TRY_FIRST_MONITOR" in branch_block:
+    body = m.group(2)
+    if AUTO_FIRST_MONITOR_TAG in body:
         return text  # already patched
 
-    replacement_block = textwrap.dedent(r"""
-        /* === OPINIONATED_PATCH_TRY_FIRST_MONITOR ===
-         * Try unattended path: start the first monitor immediately.
-         * Only fall back to the chooser dialog if that fails.
-         *
-         * Visual impact:
-         *   - The monitor selection grid (two tiles) usually won’t be shown; we auto-pick the first tile.
-         */
-        if (start_first_monitor (screen_cast_session))
-          return TRUE;
-        /* Fallback to original chooser dialog */
-        ScreenCastDialogHandle *dialog_handle;
-        dialog_handle = create_screen_cast_dialog (screen_cast_session,
-                                                   invocation,
-                                                   request,
-                                                   arg_parent_window);
-        screen_cast_session->dialog_handle = dialog_handle;
-        /* === /OPINIONATED_PATCH_TRY_FIRST_MONITOR === */
-    """).strip("\n")
-
-    # Normalize the whole branch to use screen_cast_session explicitly (46.2/49.0 both use it)
-    new_body = re.sub(
-        branch_re,
-        "if (!restore_stream_from_data (screen_cast_session)) {\n"
-        + replacement_block +
-        "\n}",
-        body,
-        flags=re.S
+    child_count_if_re = (
+        r"if\s*\(\s*screen_cast_geometry_container_get_child_count\s*\(\s*SCREEN_CAST_GEOMETRY_CONTAINER\s*\(\s*monitor_container\s*\)\s*\)\s*==\s*1\s*\)\s*\{\s*"
+        r"gtk_widget_add_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
+        r"\}\s*else\s*\{\s*"
+        r"gtk_widget_remove_css_class\s*\(\s*monitor_container\s*,\s*\"singular\"\s*\)\s*;\s*"
+        r"\}"
     )
 
-    text = text[:hm.start(2)] + new_body + text[hm.end(2):]
-    return text
+    replacement = textwrap.dedent(f"""
+        int child_count = screen_cast_geometry_container_get_child_count (SCREEN_CAST_GEOMETRY_CONTAINER (monitor_container));
+        if (child_count == 1)
+          gtk_widget_add_css_class (monitor_container, "singular");
+        else
+          gtk_widget_remove_css_class (monitor_container, "singular");
 
-# ----------------------------------- MAIN ------------------------------------
+        /* === {AUTO_FIRST_MONITOR_TAG} ===
+         * For truly unattended use: auto-select the first monitor when present
+         * and single-selection is enforced.
+         */
+        if (child_count > 0 && !widget->allow_multiple)
+          {{
+            GtkWidget *first_button = gtk_widget_get_first_child (monitor_container);
+            if (first_button)
+              gtk_toggle_button_set_active (GTK_TOGGLE_BUTTON (first_button), TRUE);
+          }}
+        /* === /{AUTO_FIRST_MONITOR_TAG} === */
+    """).strip("\n")
+
+    if not re.search(child_count_if_re, body, flags=re.S):
+        die(
+            "update_monitor_container(): expected inline 'singular' CSS toggle block not found.\n"
+            "This patch relies on the 46.2/49.0 structure that toggles 'singular' based on\n"
+            "screen_cast_geometry_container_get_child_count(...).",
+            "screencastwidget.c"
+        )
+
+    new_body = re.sub(child_count_if_re, replacement, body, flags=re.S, count=1)
+    return text[:m.start(2)] + new_body + text[m.end(2):]
+
+# ------------------------------- utilities ------------------------------------
+
+def preview_changed_region(before, after, label, max_lines=120):
+    diff = list(difflib.unified_diff(
+        before.splitlines(keepends=False),
+        after.splitlines(keepends=False),
+        fromfile=label + " (before)",
+        tofile=label + " (after)",
+        lineterm=""
+    ))
+    if not diff:
+        print(f"[SKIP] {label}: no changes")
+        return
+    print(f"[DIFF] {label}: showing up to {max_lines} lines of diff:")
+    for i, line in enumerate(diff):
+        if i >= max_lines:
+            print("  ... (diff truncated)")
+            break
+        print(line)
+
+# ----------------------------------- main -------------------------------------
 
 def main():
     if len(sys.argv) != 2:
-        die("Provide the path to your local checkout of the chosen tag (e.g., 46.2/49.0):\n"
+        die("Provide the path to your local checkout (e.g., 46.2/49.0):\n"
             "  python3 patch_portal_autoapprove.py /path/to/xdg-desktop-portal-gnome")
 
     root = os.path.abspath(sys.argv[1])
@@ -394,44 +311,51 @@ def main():
     if detected:
         print(f"[info] Detected checkout: {detected}")
 
+    # Ensure files exist
+    paths = {}
     for short, rel in REQUIRED_FILES.items():
         p = os.path.join(root, rel)
         if not os.path.isfile(p):
             die(f"Missing required file: {p}\n"
-                "You did not point me at a supported source tree (or tree is incomplete).")
+                "You did not point me at a supported source tree (or tree is incomplete).",
+                short)
+        paths[short] = p
 
-    # Validate sentinels
+    # REFUSE to proceed if ANY .bak already exists
+    existing_baks = [p + ".bak" for p in paths.values() if os.path.exists(p + ".bak")]
+    if existing_baks:
+        msg = ["Refusing to proceed because the following backups already exist:"]
+        msg += [f"  - {b}" for b in existing_baks]
+        msg.append("Move/rename these .bak files and re-run.")
+        die("\n".join(msg), None)
+
+    # Read + sentinel check
     texts = {}
-    for short, rel in REQUIRED_FILES.items():
-        p = os.path.join(root, rel)
+    for short, p in paths.items():
         s = read(p)
-        assert_sentinels(p, s, SENTINELS[short])
-        texts[short] = (p, s)
+        assert_sentinels(p, s, SENTINELS[short], short)
+        texts[short] = s
 
-    # Patch remotedesktopdialog.c (mapped-aware auto-approve)
-    rpath, rtext = texts["remotedesktopdialog.c"]
-    rpatched = patch_remotedesktopdialog_c(rtext)
+    # Patch files
+    r_before = texts["remotedesktopdialog.c"]
+    r_after  = patch_remotedesktopdialog_c(r_before)
 
-    # Patch screencast.c (auto-pick first monitor)
-    spath, stext = texts["screencast.c"]
-    spatched = patch_screencast_c(stext)
+    s_before = texts["screencastwidget.c"]
+    s_after  = patch_screencastwidget_c(s_before)
 
-    # Write
-    if rpatched != rtext:
-        write_backup_then(rpath, rpatched)
-        print(f"[OK] Patched {rpath} (backup at {rpath}.bak)")
-    else:
-        print(f"[SKIP] {rpath} already patched; left as-is (backup untouched).")
+    # Write with backups (this also creates .bak)
+    write_with_backup(paths["remotedesktopdialog.c"], r_after)
+    print(f"[OK] Patched {paths['remotedesktopdialog.c']} (backup at {paths['remotedesktopdialog.c']}.bak)")
+    preview_changed_region(r_before, r_after, os.path.basename(paths["remotedesktopdialog.c"]))
 
-    if spatched != stext:
-        write_backup_then(spath, spatched)
-        print(f"[OK] Patched {spath} (backup at {spath}.bak)")
-    else:
-        print(f"[SKIP] {spath} already patched; left as-is (backup untouched).")
+    write_with_backup(paths["screencastwidget.c"], s_after)
+    print(f"[OK] Patched {paths['screencastwidget.c']} (backup at {paths['screencastwidget.c']}.bak)")
+    preview_changed_region(s_before, s_after, os.path.basename(paths["screencastwidget.c"]))
 
     print("\nNext steps:\n"
-          "  1) Build + install (see README.md)\n"
-          "  2) Restart user portal services\n")
+          "  1) Build + install (per the project README)\n"
+          "  2) Restart portal services (e.g., log out/in, or: "
+          "systemctl --user restart xdg-desktop-portal{,-gnome})\n")
 
 if __name__ == "__main__":
     main()

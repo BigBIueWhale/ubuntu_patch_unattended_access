@@ -8,7 +8,7 @@ This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.
 
 > **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` so that:
 >
-> * **Remote-Desktop** is **auto-approved** with **“Allow Remote Interaction”** enabled (no consent dialog).
+> * **Remote-Desktop** is **auto-approved** with **“Allow Remote Interaction”** enabled — **no user interaction** (mapped-aware + idle fallback ensures it fires even if `notify::mapped` misbehaves).
 > * **Screencast** auto-selects the **first monitor** when there’s no valid restore data (no chooser).
 >
 > Use only on machines you own/administer. This intentionally bypasses a security prompt.
@@ -98,7 +98,19 @@ If no compatible tag is found, the script will explain recent failures (GTK requ
 python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
 ```
 
-**Expect:** Lines like `[OK] Patched …remotedesktopdialog.c` and `[OK] Patched …screencast.c`.
+**Expect:**
+
+* Verifies the expected layout using strict sentinels.
+
+* **Refuses to run if a `.bak` backup already exists** for any target file (safety).
+
+* Creates backups:
+
+  * `sources/xdg-desktop-portal-gnome/src/remotedesktopdialog.c.bak`
+  * `sources/xdg-desktop-portal-gnome/src/screencastwidget.c.bak`
+
+* Prints `[OK] Patched …remotedesktopdialog.c` and `[OK] Patched …screencastwidget.c` (or `[SKIP] … already patched`).
+
 If you see `[ERROR] Sentinel not found`, the checked-out sources **don’t match the expected layout** for this patcher. See the **Patcher layout note** below.
 
 ```bash
@@ -290,10 +302,14 @@ python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
 **Expect:**
 
 * Verifies the expected layout using strict sentinels.
+
 * Creates backups:
 
   * `sources/xdg-desktop-portal-gnome/src/remotedesktopdialog.c.bak`
-  * `sources/xdg-desktop-portal-gnome/src/screencast.c.bak`
+  * `sources/xdg-desktop-portal-gnome/src/screencastwidget.c.bak`
+
+* **Refuses to run if any of those `.bak` files already exist** (to protect an earlier backup).
+
 * Prints `[OK] Patched ...` (or `[SKIP] ... already patched`)
 
 If you get `[ERROR]` about sentinels/layout, the checked-out tag’s code doesn’t exactly match what the patcher expects.
@@ -368,7 +384,7 @@ APT/dpkg does not treat your `/usr` install as a “local modification.”
 ```bash
 # Prevent upgrades from overwriting the patched portal backend
 sudo apt-mark hold xdg-desktop-portal-gnome
-````
+```
 
 **Verify the hold:**
 
@@ -395,28 +411,42 @@ sudo apt upgrade
 
 * **`src/remotedesktopdialog.c`**
 
-  * Adds a helper `auto_approve_remote_desktop_idle(...)` that:
-    * Turns **“Allow Remote Interaction”** ON.
-    * Marks a source as “selected” so **Share** is permitted.
-    * Invokes the dialog’s accept handler (**as if Share was clicked**).
+  * Adds a helper `auto_share_response(RemoteDesktopDialog *dialog)` that:
+
+    * Forces a selection state so **Share** is permitted:
+      `dialog->is_screen_cast_sources_selected = TRUE;`
+    * Turns **“Allow Remote Interaction”** ON:
+      `adw_switch_row_set_active(dialog->allow_remote_interaction_switch, TRUE);`
+    * Re-evaluates button sensitivity:
+      `update_button_sensitivity(dialog);`
+    * Programmatically **clicks Share**:
+      `g_signal_emit_by_name(dialog->accept_button, "clicked");`
 
   * Adds a **mapped-aware** one-shot handler `on_dialog_notify_mapped(...)` that:
+
     * Hooks **`notify::mapped`** (fires when the window is actually on-screen).
-    * **Schedules** the helper via `g_timeout_add(120, …)` (≈ one tick later).  
+    * **Schedules** the helper via `g_timeout_add(120, …)` (≈ one tick later).
       This is **non-blocking** and gives callers (TeamViewer/RustDesk) time to connect their “done” signal before we auto-accept.
 
-  * Inside `remote_desktop_dialog_new(...)`, installs this mapping hook:
+  * Inside `remote_desktop_dialog_init(...)` (right after `gtk_widget_init_template(GTK_WIDGET(dialog));`), installs **both**:
+
     * `g_signal_connect_after(dialog, "notify::mapped", G_CALLBACK(on_dialog_notify_mapped), dialog);`
-    * Removes any old “immediate click” or “idle-only” scheduling blocks if they exist (to avoid double fire).
+    * **Idle fallback**: `g_idle_add((GSourceFunc) auto_share_response, dialog);` (runs even if the mapping notify never arrives).
 
-  **Result:** The consent dialog never blocks. It may flash briefly or not appear, then auto-dismisses **after it’s actually mapped**, and only after a short, non-blocking defer—so the caller reliably receives the “done” reply. This eliminates the “no pop up + connection fails” race.
+  **Result:** The consent dialog never blocks. It may flash briefly or not appear, then auto-dismisses **after it’s actually mapped** (or via idle fallback), and only after a short, non-blocking defer—so the caller reliably receives the “done” reply. This eliminates the “no pop up + connection fails” race and guarantees **truly unattended** operation.
 
-* **`src/screencast.c`**
+* **`src/screencastwidget.c`**
 
-  * Adds `start_first_monitor(ScreenCastSession*)` to select the **first logical monitor** and call `start_session(...)`.
-  * In `handle_start(...)`: if `restore_stream_from_data(...)` fails, attempts unattended **first-monitor** start before falling back to the chooser.
+  * In `update_monitor_container(ScreenCastWidget *widget)`:
 
-  **Result:** When there is no valid restore token, Screencast auto-shares the first monitor without prompting; the monitor grid typically never appears.
+    * Stores `int child_count = screen_cast_geometry_container_get_child_count(...);`
+    * Preserves the original **“singular”** CSS toggle.
+    * **Auto-selects the first monitor** when `child_count > 0 && !widget->allow_multiple`:
+
+      * `GtkWidget *first_button = gtk_widget_get_first_child(monitor_container);`
+      * `gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(first_button), TRUE);`
+
+  **Result:** When there is no valid restore token, Screencast preselects the first monitor automatically; combined with the dialog changes above, the monitor grid typically never appears **and no user interaction is required**.
 
 ---
 
@@ -455,7 +485,7 @@ sudo apt install --reinstall xdg-desktop-portal-gnome && systemctl --user daemon
 Why: Undo just your source edits while keeping your local build flow.
 
 ```bash
-cd ./sources/xdg-desktop-portal-gnome && cp src/remotedesktopdialog.c.bak src/remotedesktopdialog.c && cp src/screencast.c.bak src/screencast.c && meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build && sudo ninja -C build install && systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal-gnome.service xdg-desktop-portal.service
+cd ./sources/xdg-desktop-portal-gnome && cp src/remotedesktopdialog.c.bak src/remotedesktopdialog.c && cp src/screencastwidget.c.bak src/screencastwidget.c && meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build && sudo ninja -C build install && systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal-gnome.service xdg-desktop-portal.service
 ```
 
 **Expect:** Services restart; patched behavior is removed.
@@ -489,7 +519,7 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 * Files affected:
 
   * `src/remotedesktopdialog.c`
-  * `src/screencast.c`
+  * `src/screencastwidget.c`
 
 ---
 
@@ -502,6 +532,8 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 * **Missing deps:** Re-run Section 2; then `meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build`.
 * **Portal logs:** `journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-pager` to inspect startup and requests.
 * **App still prompts:** Confirm the request goes through **xdg-desktop-portal** (visible in logs) and that the GNOME backend is in use (not KDE/wlr).
+* **“Backup already exists” error:** The patcher refuses to overwrite existing backups. Move/rename `src/*.c.bak` files and re-run.
+* **Never require interaction guarantee:** Ensure your `remotedesktopdialog.c` contains both the mapped hook and the idle fallback, and that `auto_share_response(...)` sets `dialog->is_screen_cast_sources_selected = TRUE;`.
 
 ---
 
