@@ -6,6 +6,8 @@ How to get rid of this brain-dead prompt that keeps appearing on Wayland when tr
 
 This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.04 LTS (Noble)** with **GNOME on Wayland** and the **GNOME xdg-desktop-portal backend**. Now supports unattended approval for both RemoteDesktop (e.g., TeamViewer) and ScreenCast (e.g., RustDesk).
 
+Tested and verified working with `RustDesk Version: 1.4.3` and `TeamViewer 15.70.6`.
+
 > **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` so that:
 >
 > * **Remote-Desktop** is **auto-approved** with **“Allow Remote Interaction”** enabled — **no user interaction** (mapped-aware + idle fallback ensures it fires even if `notify::mapped` misbehaves).
