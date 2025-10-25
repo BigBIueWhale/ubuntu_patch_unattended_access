@@ -3,7 +3,8 @@
 patch_portal_autoapprove.py
 
 Strict, mapped-aware + idle-fallback patcher for GNOME's xdg-desktop-portal-gnome
-to allow truly unattended Remote Desktop consent + first-monitor auto-selection.
+to allow truly unattended Remote Desktop consent + first-monitor auto-selection
++ ScreenCast consent auto-approve.
 
 Guarantees:
   • The consent dialog is auto-accepted even if the monitor grid hasn't populated.
@@ -12,6 +13,7 @@ Guarantees:
 Targets (validated against tags 46.2 and 49.0):
   - src/remotedesktopdialog.c
   - src/screencastwidget.c
+  - src/screencastdialog.c
 
 If anything does not match the expected layout, this script fails loudly and prints
 canonical upstream links to compare.
@@ -32,6 +34,7 @@ import sys, os, re, textwrap, shutil, subprocess, difflib
 REQUIRED_FILES = {
     "remotedesktopdialog.c": "src/remotedesktopdialog.c",
     "screencastwidget.c":    "src/screencastwidget.c",
+    "screencastdialog.c":    "src/screencastdialog.c",
 }
 
 # --- Sentinels for known-good layouts (46.2 / 49.0). ---
@@ -48,6 +51,13 @@ SENTINELS = {
         r"^static void\s+update_monitor_container\s*\(\s*ScreenCastWidget\s*\*widget\)",
         r"^static void\s+screen_cast_widget_init\s*\(\s*ScreenCastWidget\s*\*widget\)",
     ],
+    "screencastdialog.c": [
+        r"^G_DEFINE_TYPE\s*\(\s*ScreenCastDialog\s*,\s*screen_cast_dialog\s*,\s*ADW_TYPE_WINDOW\s*\)",
+        r"^static void\s+on_button_clicked_cb\s*\(\s*GtkWidget\s*\*button,\s*.*?ScreenCastDialog\s*\*dialog\)",
+        r"^static void\s+on_has_selection_changed\s*\(\s*ScreenCastWidget\s*\*screen_cast_widget,\s*.*?ScreenCastDialog\s*\*dialog\)",
+        r"^static gboolean\s+screen_cast_dialog_close_request\s*\(\s*GtkWindow\s*\*dialog\)",
+        r"^static void\s+screen_cast_dialog_init\s*\(\s*ScreenCastDialog\s*\*dialog\)",
+    ],
 }
 
 HELP_LINKS = {
@@ -58,6 +68,10 @@ HELP_LINKS = {
     "screencastwidget.c": [
         "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/46.2/src/screencastwidget.c",
         "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/49.0/src/screencastwidget.c",
+    ],
+    "screencastdialog.c": [
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/46.2/src/screencastdialog.c",
+        "https://gitlab.gnome.org/GNOME/xdg-desktop-portal-gnome/-/blob/49.0/src/screencastdialog.c",
     ],
 }
 
@@ -430,6 +444,98 @@ def patch_screencastwidget_c(text):
         "screencastwidget.c"
     )
 
+# -------------------------- screencastdialog.c -----------------------------
+
+def _insert_screencast_helpers(text):
+    """Insert helpers BEFORE screen_cast_dialog_init()."""
+    if AUTO_HELPERS_TAG in text:
+        return text
+
+    init_decl = re.search(
+        r"\n(static\s+void\s+screen_cast_dialog_init\s*\(\s*ScreenCastDialog\s*\*dialog\s*\)\s*\{)",
+        text
+    )
+    if not init_decl:
+        die("Could not find screen_cast_dialog_init() to anchor helper insertion.", "screencastdialog.c")
+
+    helpers = textwrap.dedent(f"""
+        /* === {AUTO_HELPERS_TAG} ===
+         * Auto-Share: assuming selection is ready (via screencastwidget patch),
+         * programmatically click Share. This is used by both the mapped hook and idle fallback.
+         */
+        static gboolean
+        auto_share_response (ScreenCastDialog *dialog)
+        {{
+          /* Programmatically press the "Share" button. */
+          g_signal_emit_by_name (dialog->accept_button, "clicked");
+
+          return G_SOURCE_REMOVE; /* run once */
+        }}
+
+        static void
+        on_dialog_notify_mapped (GObject *obj, GParamSpec *pspec, gpointer user_data)
+        {{
+          GtkWidget *w = GTK_WIDGET (obj);
+          if (!gtk_widget_get_mapped (w))
+            return;
+
+          /* Run only once */
+          g_signal_handlers_disconnect_by_func (obj, G_CALLBACK (on_dialog_notify_mapped), user_data);
+
+          /* Defer slightly so external code has its "done" handlers connected. */
+          g_timeout_add (120, (GSourceFunc) auto_share_response, user_data);
+        }}
+        /* === /{AUTO_HELPERS_TAG} === */
+    """).strip("\n") + "\n\n"
+
+    insert_at = init_decl.start(1)
+    return text[:insert_at] + helpers + text[insert_at:]
+
+def patch_screencastdialog_c(text):
+    """
+    1) Insert helpers above screen_cast_dialog_init().
+    2) In screen_cast_dialog_init(), right after gtk_widget_init_template(GTK_WIDGET(dialog));
+       install BOTH:
+         - mapped-aware notify::mapped hook -> on_dialog_notify_mapped
+         - idle fallback -> g_idle_add(auto_share_response, dialog)
+    """
+    text = _insert_screencast_helpers(text)
+
+    func_re = r"(static\s+void\s+screen_cast_dialog_init\s*\(\s*ScreenCastDialog\s*\*dialog\s*\)\s*\{\s*)(.*?)(\n\}\s*)"
+    m = re.search(func_re, text, flags=re.S)
+    if not m:
+        die("Could not locate screen_cast_dialog_init() body for patching.", "screencastdialog.c")
+
+    prefix, body, suffix = m.group(1), m.group(2), m.group(3)
+
+    anchor_re = r"gtk_widget_init_template\s*\(\s*GTK_WIDGET\s*\(\s*dialog\s*\)\s*\)\s*;"
+    if not re.search(anchor_re, body):
+        die("screen_cast_dialog_init(): expected gtk_widget_init_template(GTK_WIDGET(dialog)); not found.",
+            "screencastdialog.c")
+
+    if (MAPPED_SCHEDULE_TAG in body) or ("notify::mapped" in body and "on_dialog_notify_mapped" in body):
+        # If previous version exists but without idle fallback, add idle fallback if missing.
+        if "g_idle_add" not in body:
+            body_new = re.sub(anchor_re, lambda m: m.group(0) + "\n\n  g_idle_add ((GSourceFunc) auto_share_response, dialog);\n", body, count=1)
+            return text[:m.start(2)] + body_new + text[m.end(2):]
+        return text
+
+    inject = textwrap.dedent(f"""
+        /* === {MAPPED_SCHEDULE_TAG} ===
+         * Schedule auto-share after the dialog is mapped, and also schedule an idle fallback.
+         */
+        g_signal_connect_after (dialog,
+                                "notify::mapped",
+                                G_CALLBACK (on_dialog_notify_mapped),
+                                dialog);
+        /* Idle fallback: if mapped notify never arrives, still auto-approve */
+        g_idle_add ((GSourceFunc) auto_share_response, dialog);
+        /* === /{MAPPED_SCHEDULE_TAG} === */
+    """).strip("\n")
+
+    body_new = re.sub(anchor_re, lambda m: m.group(0) + "\n\n  " + inject + "\n", body, count=1)
+    return text[:m.start(2)] + body_new + text[m.end(2):]
+
 # ------------------------------- utilities ------------------------------------
 
 def preview_changed_region(before, after, label, max_lines=120):
@@ -495,6 +601,9 @@ def main():
     s_before = texts["screencastwidget.c"]
     s_after  = patch_screencastwidget_c(s_before)
 
+    sc_before = texts["screencastdialog.c"]
+    sc_after  = patch_screencastdialog_c(sc_before)
+
     # Write with backups (this also creates .bak)
     write_with_backup(paths["remotedesktopdialog.c"], r_after)
     print(f"[OK] Patched {paths['remotedesktopdialog.c']} (backup at {paths['remotedesktopdialog.c']}.bak)")
@@ -503,6 +612,10 @@ def main():
     write_with_backup(paths["screencastwidget.c"], s_after)
     print(f"[OK] Patched {paths['screencastwidget.c']} (backup at {paths['screencastwidget.c']}.bak)")
     preview_changed_region(s_before, s_after, os.path.basename(paths["screencastwidget.c"]))
+
+    write_with_backup(paths["screencastdialog.c"], sc_after)
+    print(f"[OK] Patched {paths['screencastdialog.c']} (backup at {paths['screencastdialog.c']}.bak)")
+    preview_changed_region(sc_before, sc_after, os.path.basename(paths["screencastdialog.c"]))
 
     print("\nNext steps:\n"
           "  1) Build + install (per the project README)\n"

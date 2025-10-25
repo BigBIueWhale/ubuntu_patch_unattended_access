@@ -4,12 +4,12 @@ How to get rid of this brain-dead prompt that keeps appearing on Wayland when tr
 
 <img src="doc/remote_desktop_pop_up.png" style="max-width: 420px; width: 100%;" alt="Screenshot" />
 
-This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.04 LTS (Noble)** with **GNOME on Wayland** and the **GNOME xdg-desktop-portal backend**.
+This README is **strict and opinionated**. Follow it **exactly** on **Ubuntu 24.04 LTS (Noble)** with **GNOME on Wayland** and the **GNOME xdg-desktop-portal backend**. Now supports unattended approval for both RemoteDesktop (e.g., TeamViewer) and ScreenCast (e.g., RustDesk).
 
 > **What this does:** Applies a minimal patch to GNOME’s `xdg-desktop-portal-gnome` so that:
 >
 > * **Remote-Desktop** is **auto-approved** with **“Allow Remote Interaction”** enabled — **no user interaction** (mapped-aware + idle fallback ensures it fires even if `notify::mapped` misbehaves).
-> * **Screencast** auto-selects the **first monitor** when there’s no valid restore data (no chooser).
+> * **Screencast** auto-selects the **first monitor** when there’s no valid restore data (no chooser) and **auto-approves** the Share/Accept action — **no user interaction**.
 >
 > Use only on machines you own/administer. This intentionally bypasses a security prompt.
 
@@ -105,11 +105,11 @@ python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
 * **Refuses to run if a `.bak` backup already exists** for any target file (safety).
 
 * Creates backups:
-
   * `sources/xdg-desktop-portal-gnome/src/remotedesktopdialog.c.bak`
   * `sources/xdg-desktop-portal-gnome/src/screencastwidget.c.bak`
+  * `sources/xdg-desktop-portal-gnome/src/screencastdialog.c.bak`
 
-* Prints `[OK] Patched …remotedesktopdialog.c` and `[OK] Patched …screencastwidget.c` (or `[SKIP] … already patched`).
+* Prints `[OK] Patched …remotedesktopdialog.c`, `[OK] Patched …screencastwidget.c`, and `[OK] Patched …screencastdialog.c` (or `[SKIP] … already patched`).
 
 If you see `[ERROR] Sentinel not found`, the checked-out sources **don’t match the expected layout** for this patcher. See the **Patcher layout note** below.
 
@@ -304,9 +304,9 @@ python3 ./patch_portal_autoapprove.py ./sources/xdg-desktop-portal-gnome
 * Verifies the expected layout using strict sentinels.
 
 * Creates backups:
-
   * `sources/xdg-desktop-portal-gnome/src/remotedesktopdialog.c.bak`
   * `sources/xdg-desktop-portal-gnome/src/screencastwidget.c.bak`
+  * `sources/xdg-desktop-portal-gnome/src/screencastdialog.c.bak`
 
 * **Refuses to run if any of those `.bak` files already exist** (to protect an earlier backup).
 
@@ -448,15 +448,35 @@ sudo apt upgrade
 
   **Result:** When there is no valid restore token, Screencast preselects the first monitor automatically; combined with the dialog changes above, the monitor grid typically never appears **and no user interaction is required**.
 
+* **`src/screencastdialog.c`**
+
+  * Adds a helper `auto_share_response(ScreenCastDialog *dialog)` that:
+
+    * Programmatically **clicks Share**:
+      `g_signal_emit_by_name(dialog->accept_button, "clicked");`
+
+  * Adds a **mapped-aware** one-shot handler `on_dialog_notify_mapped(...)` that:
+
+    * Hooks **`notify::mapped`** (fires when the window is actually on-screen).
+    * **Schedules** the helper via `g_timeout_add(120, …)` (≈ one tick later).
+      This is **non-blocking** and gives callers (e.g., RustDesk) time to connect their “done” signal before we auto-accept.
+
+  * Inside `screen_cast_dialog_init(...)` (right after `gtk_widget_init_template(GTK_WIDGET(dialog));`), installs **both**:
+
+    * `g_signal_connect_after(dialog, "notify::mapped", G_CALLBACK(on_dialog_notify_mapped), dialog);`
+    * **Idle fallback**: `g_idle_add((GSourceFunc) auto_share_response, dialog);` (runs even if the mapping notify never arrives).
+
+  **Result:** The ScreenCast consent dialog never blocks. It may flash briefly or not appear, then auto-dismisses **after it’s actually mapped** (or via idle fallback), and only after a short, non-blocking defer—so the caller reliably receives the “done” reply. This enables **truly unattended** ScreenCast flows like RustDesk.
+
 ---
 
 ## 9) Testing
 
 Why: Validates behavior at runtime.
 
-1. Start a Remote-Desktop/Screencast client that uses **xdg-desktop-portal** (e.g., RustDesk server integration).
+1. Start a Remote-Desktop/Screencast client that uses **xdg-desktop-portal** (e.g., TeamViewer or RustDesk server integration).
 2. Observe that no consent dialog appears.
-3. The session should start with **remote input allowed** and the **first monitor** shared.
+3. The session should start with **remote input allowed** (for RemoteDesktop) and the **first monitor** shared (for ScreenCast).
 
 Optional live logs:
 
@@ -485,7 +505,7 @@ sudo apt install --reinstall xdg-desktop-portal-gnome && systemctl --user daemon
 Why: Undo just your source edits while keeping your local build flow.
 
 ```bash
-cd ./sources/xdg-desktop-portal-gnome && cp src/remotedesktopdialog.c.bak src/remotedesktopdialog.c && cp src/screencastwidget.c.bak src/screencastwidget.c && meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build && sudo ninja -C build install && systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal-gnome.service xdg-desktop-portal.service
+cd ./sources/xdg-desktop-portal-gnome && cp src/remotedesktopdialog.c.bak src/remotedesktopdialog.c && cp src/screencastwidget.c.bak src/screencastwidget.c && cp src/screencastdialog.c.bak src/screencastdialog.c && meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build && sudo ninja -C build install && systemctl --user daemon-reload && systemctl --user restart xdg-desktop-portal-gnome.service xdg-desktop-portal.service
 ```
 
 **Expect:** Services restart; patched behavior is removed.
@@ -520,6 +540,7 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 
   * `src/remotedesktopdialog.c`
   * `src/screencastwidget.c`
+  * `src/screencastdialog.c`
 
 ---
 
@@ -532,6 +553,7 @@ This removes a user consent step that GNOME ships intentionally. Apply only on s
 * **Missing deps:** Re-run Section 2; then `meson setup build --wipe --prefix=/usr --buildtype=release && ninja -C build`.
 * **Portal logs:** `journalctl --user -u xdg-desktop-portal-gnome -u xdg-desktop-portal -b --no-pager` to inspect startup and requests.
 * **App still prompts:** Confirm the request goes through **xdg-desktop-portal** (visible in logs) and that the GNOME backend is in use (not KDE/wlr).
+* **RustDesk still prompts:** Confirm the request uses the ScreenCast portal path (check logs for "ScreenCast" mentions) and that the first monitor is auto-selected (via screencastwidget patch). Ensure the GNOME backend is active.
 * **“Backup already exists” error:** The patcher refuses to overwrite existing backups. Move/rename `src/*.c.bak` files and re-run.
 * **Never require interaction guarantee:** Ensure your `remotedesktopdialog.c` contains both the mapped hook and the idle fallback, and that `auto_share_response(...)` sets `dialog->is_screen_cast_sources_selected = TRUE;`.
 
